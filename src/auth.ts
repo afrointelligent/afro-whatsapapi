@@ -86,11 +86,19 @@ function slugify(value: string) {
   return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 54) || 'workspace'
 }
 
+function normalizePhone(value: string) {
+  const trimmed = value.trim()
+  const normalized = trimmed.replace(/[^\d+]/g, '')
+  if (!/^\+?\d{7,15}$/.test(normalized)) throw new Error('Enter a valid business phone number.')
+  return normalized
+}
+
 export async function registerOwner(db: Db, input: { firstName: string; lastName: string; email: string; password: string; businessName: string; industry: string; country: string; businessPhone: string }) {
   const email = input.email.trim().toLowerCase()
   if (!/^\S+@\S+\.\S+$/.test(email)) throw new Error('Enter a valid business email address.')
   if (input.password.length < 12) throw new Error('Use a password with at least 12 characters.')
   if (![input.firstName, input.lastName, input.businessName, input.industry, input.country, input.businessPhone].every(value => value.trim())) throw new Error('Complete every required registration field.')
+  const businessPhone = normalizePhone(input.businessPhone)
   if (await db.collection<UserDocument>('users').findOne({ email })) throw new Error('An account already exists for that email address.')
 
   const now = new Date()
@@ -100,17 +108,22 @@ export async function registerOwner(db: Db, input: { firstName: string; lastName
   let slug = baseSlug
   let suffix = 1
   while (await db.collection('tenants').findOne({ slug })) slug = `${baseSlug}-${++suffix}`
-  const tenant = { _id: tenantId, name: input.businessName.trim(), slug, industry: input.industry.trim(), country: input.country.trim(), businessPhone: input.businessPhone.trim(), status: 'ACTIVE', createdAt: now, updatedAt: now }
-  await db.collection<UserDocument>('users').insertOne(user)
   try {
+    await db.collection<UserDocument>('users').insertOne(user)
+    const tenant = { _id: tenantId, name: input.businessName.trim(), slug, industry: input.industry.trim(), country: input.country.trim(), businessPhone, status: 'ACTIVE', createdAt: now, updatedAt: now }
     await db.collection('tenants').insertOne(tenant)
     await db.collection('tenantMemberships').insertOne({ tenantId, userId: user._id, role: 'OWNER' satisfies UserRole, createdAt: now, updatedAt: now })
     await db.collection('auditLogs').insertOne({ tenantId, userId: user._id, action: 'ACCOUNT_CREATED', createdAt: now, metadata: { source: 'public_registration' } })
+    return { user, tenant, role: 'OWNER' as const }
   } catch (error) {
-    await db.collection<UserDocument>('users').deleteOne({ _id: user._id })
+    await Promise.allSettled([
+      db.collection<UserDocument>('users').deleteOne({ _id: user._id }),
+      db.collection('tenants').deleteOne({ _id: tenantId }),
+      db.collection('tenantMemberships').deleteMany({ tenantId }),
+      db.collection('auditLogs').deleteMany({ tenantId }),
+    ])
     throw error
   }
-  return { user, tenant, role: 'OWNER' as const }
 }
 
 export async function loginUser(db: Db, emailInput: string, password: string) {

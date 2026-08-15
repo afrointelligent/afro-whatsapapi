@@ -87,6 +87,17 @@ async function requirePlatformAdmin(req: Request, res: Response) {
   return session
 }
 
+function requireInternalKey(req: Request, res: Response) {
+  const key = process.env.INTERNAL_API_KEY
+  const received = req.header('authorization')?.replace(/^Bearer\s+/i, '')
+  if (!key) { res.status(503).json({ error: 'Internal API key is not configured.' }); return false }
+  if (!received) { res.status(404).end(); return false }
+  const expected = Buffer.from(key)
+  const actual = Buffer.from(received)
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) { res.status(404).end(); return false }
+  return true
+}
+
 app.post('/api/auth/register', async (req, res) => {
   try {
     const body = req.body ?? {}
@@ -123,6 +134,46 @@ app.get('/api/auth/me', async (req, res) => {
   const db = await getDb()
   const [tenant, user] = await Promise.all([db.collection('tenants').findOne({ _id: session.tenantId }, { projection: { name: 1, industry: 1, country: 1, businessPhone: 1, status: 1, workspaceSetup: 1 } }), db.collection('users').findOne({ _id: session.userId }, { projection: { platformAdmin: 1 } })])
   res.json({ user: { id: String(session.userId), email: session.email, name: session.name, role: session.role, platformAdmin: Boolean(user?.platformAdmin) }, tenant: tenant ? { id: String(tenant._id), ...tenant } : null })
+})
+
+app.post('/api/internal/meta-review/provision', async (req, res) => {
+  if (!requireInternalKey(req, res)) return
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID
+  if (!phoneNumberId) return res.status(503).json({ error: 'WHATSAPP_PHONE_NUMBER_ID is not configured.' })
+  const db = await getDb()
+  const now = new Date()
+  const requestedTenantId = String(req.body?.tenantId || '').trim()
+  let tenant
+  if (requestedTenantId) {
+    if (!ObjectId.isValid(requestedTenantId)) return res.status(400).json({ error: 'Invalid tenant id.' })
+    tenant = await db.collection('tenants').findOne({ _id: new ObjectId(requestedTenantId) })
+    if (!tenant) return res.status(404).json({ error: 'Tenant not found.' })
+    await db.collection('tenants').updateOne(
+      { _id: tenant._id },
+      { $set: { reviewMode: true, industry: tenant.industry || 'Driving School', updatedAt: now } },
+    )
+  } else {
+    const slug = 'afro-drive-academy-meta-review'
+    await db.collection('tenants').updateOne(
+      { slug },
+      { $set: { name: 'Afro Drive Academy - Meta Review', slug, industry: 'Driving School', country: 'South Africa', status: 'ACTIVE', reviewMode: true, description: 'Controlled Meta App Review workspace using the approved Meta test number.', openingHours: 'Mon-Sat, 08:00-17:00', updatedAt: now }, $setOnInsert: { createdAt: now } },
+      { upsert: true },
+    )
+    tenant = await db.collection('tenants').findOne({ slug })
+  }
+  if (!tenant) return res.status(500).json({ error: 'Review tenant could not be prepared.' })
+  await db.collection('businessServices').updateOne(
+    { tenantId: tenant._id, name: 'Driving Lesson' },
+    { $set: { tenantId: tenant._id, name: 'Driving Lesson', description: '60-minute driving lesson', price: 450, durationMinutes: 60, active: true, bookingAllowed: true, updatedAt: now }, $setOnInsert: { createdAt: now } },
+    { upsert: true },
+  )
+  await db.collection('whatsappConnections').updateOne(
+    { phoneNumberId },
+    { $set: { tenantId: tenant._id, phoneNumberId, wabaId: process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || '', connectionType: 'META_TEST_NUMBER', status: 'CONNECTED', updatedAt: now }, $setOnInsert: { createdAt: now } },
+    { upsert: true },
+  )
+  await db.collection('auditLogs').insertOne({ tenantId: tenant._id, action: 'META_REVIEW_TENANT_PROVISIONED', createdAt: now, metadata: { local: process.env.NODE_ENV !== 'production' } })
+  res.json({ ok: true, tenantId: String(tenant._id), tenantName: tenant.name, phoneNumberIdConfigured: true })
 })
 
 app.delete('/api/workspace/account', async (req, res) => {
