@@ -3,7 +3,7 @@ import { MongoClient, type Collection, type Db, type ObjectId } from 'mongodb'
 let clientPromise: Promise<MongoClient> | null = null
 
 function mongoUri() {
-  return process.env.MONGODB_URI || process.env.DATABASE_URL || ''
+  return process.env.MONGODB_URI || process.env.MONGO_URL || process.env.DATABASE_URL || ''
 }
 
 export async function getDb(): Promise<Db> {

@@ -13,6 +13,7 @@ type Activity = { id: string; at: string; title: string; detail: string; tone: '
 
 const port = Number(process.env.PORT ?? 3001)
 const apiVersion = process.env.META_API_VERSION ?? 'v22.0'
+const serviceRelease = 'meta-review-inbox-2026-08-15.2'
 const app = express()
 const conversations = new Map<string, Conversation>()
 const processedMessageIds = new Set<string>()
@@ -161,17 +162,17 @@ async function respondToCustomer(conversation: Conversation, text: string) {
   }
 }
 
-app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'afro-intelligent-whatsapp-api' }))
+app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'afro-intelligent-whatsapp-api', release: serviceRelease }))
 app.get('/readiness', (_req, res) => {
   const checks = {
-    mongoConfigured: Boolean(process.env.MONGODB_URI || process.env.DATABASE_URL),
+    mongoConfigured: Boolean(process.env.MONGODB_URI || process.env.MONGO_URL || process.env.DATABASE_URL),
     webhookVerifyTokenConfigured: Boolean(process.env.WHATSAPP_VERIFY_TOKEN),
     webhookSignatureConfigured: Boolean(process.env.META_APP_SECRET),
     testPhoneConfigured: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN),
     internalApiProtected: Boolean(process.env.INTERNAL_API_KEY),
   }
   const ready = Object.values(checks).every(Boolean)
-  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', checks })
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', release: serviceRelease, checks })
 })
 
 app.get('/webhooks/whatsapp', (req, res) => {
