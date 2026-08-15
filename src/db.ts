@@ -22,7 +22,10 @@ export type WhatsAppConnection = {
   tenantId: ObjectId
   phoneNumberId: string
   wabaId?: string
-  accessToken: string
+  /** Tenant token is required for customer-owned live connections. The review
+   * test number deliberately uses the Render-only fallback token. */
+  accessToken?: string
+  connectionType?: 'META_TEST_NUMBER' | 'CUSTOMER_OWNED'
   status: 'CONNECTED' | 'DISCONNECTED' | 'ERROR'
   createdAt: Date
   updatedAt: Date
@@ -48,7 +51,7 @@ export async function recordWebhookMessage(input: {
   try {
     await processed.insertOne({ messageId: input.messageId, tenantId: input.tenantId, createdAt: now })
   } catch (error: unknown) {
-    if (typeof error === 'object' && error && 'code' in error && error.code === 11000) return { duplicate: true, conversationId: null }
+    if (typeof error === 'object' && error && 'code' in error && error.code === 11000) return { duplicate: true, conversationId: null, automationMode: null }
     throw error
   }
 
@@ -61,7 +64,14 @@ export async function recordWebhookMessage(input: {
   const conversationId = conversation?._id
   await db.collection('whatsappMessages').insertOne({ tenantId: input.tenantId, conversationId, metaMessageId: input.messageId, direction: 'inbound', content: input.content, type: input.type, timestamp: new Date(input.timestamp), createdAt: now })
   await conversations.updateOne({ _id: conversationId }, { $inc: { unreadCount: 1 } })
-  return { duplicate: false, conversationId }
+  return { duplicate: false, conversationId, automationMode: String(conversation?.automationMode || 'AI_ACTIVE') }
+}
+
+export async function recordOutboundMessage(input: { tenantId: ObjectId; conversationId: ObjectId | null; metaMessageId: string; content: string; type?: string }) {
+  const db = await getDb()
+  const now = new Date()
+  await db.collection('whatsappMessages').insertOne({ tenantId: input.tenantId, conversationId: input.conversationId, metaMessageId: input.metaMessageId, direction: 'outbound', content: input.content, type: input.type || 'text', timestamp: now, createdAt: now })
+  if (input.conversationId) await db.collection('whatsappConversations').updateOne({ _id: input.conversationId, tenantId: input.tenantId }, { $set: { lastMessage: input.content, lastMessageAt: now, updatedAt: now } })
 }
 
 export async function ensureWhatsappIndexes() {

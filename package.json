@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
+    "provision:meta-review": "node scripts/provision-meta-review-tenant.mjs",
     "start": "node dist/server.js",
     "generate:verify-token": "node scripts/generate-verify-token.mjs"
   },

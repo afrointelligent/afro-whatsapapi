@@ -3,7 +3,8 @@ import crypto from 'node:crypto'
 import cors from 'cors'
 import express, { type Request, type Response } from 'express'
 import { createProxyMiddleware } from 'http-proxy-middleware'
-import { ensureWhatsappIndexes, getConnectionForPhoneId, recordWebhookMessage, type WhatsAppConnection } from './db.js'
+import { ObjectId } from 'mongodb'
+import { ensureWhatsappIndexes, getConnectionForPhoneId, getDb, recordOutboundMessage, recordWebhookMessage, type WhatsAppConnection } from './db.js'
 
 type AutomationMode = 'AI_ACTIVE' | 'HUMAN_ACTIVE'
 type StoredMessage = { id: string; direction: 'inbound' | 'outbound'; content: string; timestamp: string; type: string }
@@ -65,6 +66,20 @@ export async function sendWhatsAppTextMessage(to: string, message: string, conne
   const result = await response.json() as { error?: { message?: string }; messages?: Array<{ id: string }> }
   if (!response.ok) throw new Error(result.error?.message ?? 'Meta Cloud API rejected the request')
   return result
+}
+
+async function sendTenantReviewReply(connection: WhatsAppConnection, customerPhone: string, conversationId: import('mongodb').ObjectId | null, content: string) {
+  if (connection.connectionType !== 'META_TEST_NUMBER') return
+  const reply = content.trim().toLowerCase().includes('lesson')
+    ? 'Thanks for your lesson enquiry. Afro Drive Academy offers a 60-minute driving lesson for R450. Reply BOOK to continue, or an agent can assist you.'
+    : 'Thanks for messaging Afro Drive Academy. Reply LESSON for driving-lesson information, or an agent can assist you.'
+  const sent = await sendWhatsAppTextMessage(customerPhone, reply, connection)
+  await recordOutboundMessage({
+    tenantId: connection.tenantId,
+    conversationId,
+    metaMessageId: sent.messages?.[0]?.id || crypto.randomUUID(),
+    content: reply,
+  })
 }
 
 async function sendWhatsAppChoiceButtons(to: string, body: string, choices: Array<{ id: string; title: string }>) {
@@ -195,21 +210,51 @@ app.post('/webhooks/whatsapp', async (req, res) => {
         timestamp: incoming.timestamp ? new Date(Number(incoming.timestamp) * 1000).toISOString() : new Date().toISOString(),
       })
       if (durableEvent.duplicate) continue
-      const conversation = getConversation(incoming.from)
-      conversation.unreadCount += 1
-      conversation.lastMessageAt = new Date().toISOString()
-      conversation.messages.push({ id: incoming.id, direction: 'inbound', type: incoming.type ?? 'text', content, timestamp: incoming.timestamp ?? conversation.lastMessageAt })
       addActivity('New WhatsApp enquiry', content.slice(0, 80))
-      if (conversation.automationMode !== 'AI_ACTIVE') continue
-      // The old demo engine is intentionally not allowed to respond to a live
-      // tenant. Live replies are enabled only once a tenant-scoped flow engine
-      // is configured, preventing one business's rules from serving another.
-      console.info(`Persisted inbound WhatsApp message for tenant ${connection.tenantId.toString()}; automation awaits published tenant flow`)
+      if (durableEvent.automationMode !== 'AI_ACTIVE') continue
+      try {
+        await sendTenantReviewReply(connection, incoming.from, durableEvent.conversationId ?? null, content)
+      } catch (error) {
+        console.error('Unable to send tenant-scoped WhatsApp reply:', error instanceof Error ? error.message : 'unknown error')
+      }
     }
   }
 })
 
-app.use(['/api/conversations', '/api/dashboard'], requireInternalApi)
+app.use(['/api/conversations', '/api/dashboard', '/api/tenants'], requireInternalApi)
+app.patch('/api/tenants/:tenantId/conversations/:conversationId/automation', async (req, res) => {
+  const { tenantId, conversationId } = req.params
+  const mode = req.body?.mode
+  if (!ObjectId.isValid(tenantId) || !ObjectId.isValid(conversationId) || !['AI_ACTIVE', 'HUMAN_ACTIVE'].includes(mode)) return res.status(400).json({ error: 'Invalid conversation or automation mode' })
+  const db = await getDb()
+  const result = await db.collection('whatsappConversations').findOneAndUpdate(
+    { _id: new ObjectId(conversationId), tenantId: new ObjectId(tenantId) },
+    { $set: { automationMode: mode, updatedAt: new Date() } },
+    { returnDocument: 'after' },
+  )
+  if (!result) return res.status(404).json({ error: 'Conversation not found' })
+  res.json({ conversation: result })
+})
+app.post('/api/tenants/:tenantId/conversations/:conversationId/reply', async (req, res) => {
+  const { tenantId, conversationId } = req.params
+  const content = String(req.body?.content || '').trim()
+  if (!ObjectId.isValid(tenantId) || !ObjectId.isValid(conversationId) || !content) return res.status(400).json({ error: 'Invalid reply request' })
+  const db = await getDb()
+  const tenantObjectId = new ObjectId(tenantId)
+  const conversationObjectId = new ObjectId(conversationId)
+  const [conversation, connection] = await Promise.all([
+    db.collection('whatsappConversations').findOne({ _id: conversationObjectId, tenantId: tenantObjectId }),
+    db.collection<WhatsAppConnection>('whatsappConnections').findOne({ tenantId: tenantObjectId, status: 'CONNECTED' }),
+  ])
+  if (!conversation || !connection) return res.status(404).json({ error: 'Connected WhatsApp conversation not found' })
+  try {
+    const sent = await sendWhatsAppTextMessage(conversation.customerPhone, content, connection)
+    await recordOutboundMessage({ tenantId: tenantObjectId, conversationId: conversationObjectId, metaMessageId: sent.messages?.[0]?.id || crypto.randomUUID(), content })
+    res.json({ ok: true, metaMessageId: sent.messages?.[0]?.id || null })
+  } catch (error) {
+    res.status(502).json({ error: error instanceof Error ? error.message : 'Unable to send WhatsApp message' })
+  }
+})
 app.get('/api/conversations', (_req, res) => res.json([...conversations.values()].sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt)).map(publicConversation)))
 app.delete('/api/conversations/:phone', (req, res) => {
   const conversation = conversations.get(req.params.phone)
