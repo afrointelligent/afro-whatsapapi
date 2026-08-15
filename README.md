@@ -1,18 +1,22 @@
-# Afro Intelligent WhatsApp API
+# Afro Intelligent WhatsApp SaaS
+
+Canonical production URL: `https://automate.afrointelligent.co.za`
 
 Render root directory: `services/whatsapp-api`  
 Build command: `npm run build`  
 Start command: `npm start`  
-Health check: `/health`
+Health check: `https://automate.afrointelligent.co.za/health`
 
-Copy `.env.example` to `.env` and fill in your Meta values. Generate a verification secret with `npm run generate:verify-token`, put it in `WHATSAPP_VERIFY_TOKEN`, and enter exactly the same value in Meta.
+The production root serves the **Never Miss a Client** SaaS landing page. Meta's production webhook callback is:
 
-For local development run `npm install`, then `npm run dev`. Expose it with `ngrok http 3001`; Meta's callback URL is `https://YOUR-NGROK-DOMAIN/webhooks/whatsapp`.
+`https://automate.afrointelligent.co.za/webhooks/whatsapp`
 
-To send a verified test-recipient message in development:
+Copy `.env.example` to `.env` for local development and fill in private values locally. Generate a verification secret with `npm run generate:verify-token`. The `WHATSAPP_VERIFY_TOKEN` value in Render must exactly match the value entered in Meta. Never commit it.
 
-```powershell
-Invoke-RestMethod http://localhost:3001/api/dev/send-message -Method Post -ContentType application/json -Body '{"to":"27XXXXXXXXX","message":"Hello from Afro Intelligent"}'
-```
+## Local development
 
-Incoming message IDs are deduplicated in memory. Use a database-backed repository before horizontally scaling the service.
+Run `npm install`, then `npm run dev`, and open `http://localhost:3001`. A temporary ngrok URL may be used only for local webhook development; it is not a production or Meta-review URL.
+
+Incoming message IDs are durably deduplicated in MongoDB. Incoming messages and delivery statuses are tenant-scoped by the recipient WhatsApp phone-number ID. POST webhook payloads require a valid `X-Hub-Signature-256` generated with `META_APP_SECRET` in production.
+
+See the `META_*.md` files for the production configuration and review checklist.

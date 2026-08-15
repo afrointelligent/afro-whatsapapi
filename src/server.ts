@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url'
 import { createProxyMiddleware } from 'http-proxy-middleware'
 import { GridFSBucket, ObjectId } from 'mongodb'
 import multer from 'multer'
-import { ensureWhatsappIndexes, getConnectionForPhoneId, getDb, recordOutboundMessage, recordWebhookMessage, type WhatsAppConnection } from './db.js'
-import { expiredSessionCookie, loginUser, readCookie, readSession, registerOwner, sessionCookie, signSession } from './auth.js'
+import { ensureWhatsappIndexes, getConnectionForPhoneId, getDb, recordMessageStatus, recordOutboundMessage, recordWebhookMessage, type WhatsAppConnection } from './db.js'
+import { expiredSessionCookie, loginUser, readCookie, readSession, registerOwner, sessionCookie, signSession, verifyPassword } from './auth.js'
 
 type AutomationMode = 'AI_ACTIVE' | 'HUMAN_ACTIVE'
 type StoredMessage = { id: string; direction: 'inbound' | 'outbound'; content: string; timestamp: string; type: string }
@@ -18,7 +18,8 @@ type Activity = { id: string; at: string; title: string; detail: string; tone: '
 const port = Number(process.env.PORT ?? 3001)
 const projectDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const apiVersion = process.env.META_API_VERSION ?? 'v22.0'
-const serviceRelease = 'meta-review-inbox-2026-08-15.2'
+const serviceRelease = 'canonical-domain-2026-08-15.1'
+const canonicalProductionOrigin = 'https://automate.afrointelligent.co.za'
 const app = express()
 const verificationUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 }, fileFilter: (_req, file, callback) => callback(null, ['application/pdf', 'image/jpeg', 'image/png'].includes(file.mimetype)) })
 const conversations = new Map<string, Conversation>()
@@ -28,6 +29,10 @@ const activities: Activity[] = []
 function addActivity(title: string, detail: string, tone: Activity['tone'] = 'info') {
   activities.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), title, detail, tone })
   activities.splice(24)
+}
+
+function publicApplicationUrl() {
+  return process.env.PUBLIC_API_URL || process.env.PRODUCT_BASE_URL || (process.env.NODE_ENV === 'production' ? canonicalProductionOrigin : `http://localhost:${port}`)
 }
 
 function credentialEncryptionKey() {
@@ -49,8 +54,18 @@ function credentialHint(value: string) {
   return clean.length <= 4 ? 'Configured' : `Ends in ${clean.slice(-4)}`
 }
 
-const allowedOrigins = process.env.FRONTEND_URL?.split(',').map(origin => origin.trim()).filter(Boolean) ?? []
-app.use(cors({ origin: process.env.NODE_ENV === 'production' ? allowedOrigins : (allowedOrigins.length ? allowedOrigins : true) }))
+const configuredOrigins = process.env.FRONTEND_URL?.split(',').map(origin => origin.trim().replace(/\/$/, '')).filter(Boolean) ?? []
+const productionOrigins = [...new Set([canonicalProductionOrigin, ...configuredOrigins])]
+const localOrigins = [...new Set([...configuredOrigins, 'http://localhost:3001', 'http://127.0.0.1:3001', 'http://localhost:3000', 'http://localhost:3002'])]
+app.use(cors({
+  credentials: true,
+  origin(origin, callback) {
+    if (!origin) return callback(null, true)
+    const trusted = process.env.NODE_ENV === 'production' ? productionOrigins : localOrigins
+    if (trusted.includes(origin.replace(/\/$/, ''))) return callback(null, true)
+    callback(new Error('Origin is not allowed by CORS'), false)
+  },
+}))
 app.use(express.json({ verify: (req, _res, buf) => { (req as Request & { rawBody?: Buffer }).rawBody = buf } }))
 app.use(express.static(path.join(projectDirectory, 'public')))
 
@@ -108,6 +123,43 @@ app.get('/api/auth/me', async (req, res) => {
   const db = await getDb()
   const [tenant, user] = await Promise.all([db.collection('tenants').findOne({ _id: session.tenantId }, { projection: { name: 1, industry: 1, country: 1, businessPhone: 1, status: 1, workspaceSetup: 1 } }), db.collection('users').findOne({ _id: session.userId }, { projection: { platformAdmin: 1 } })])
   res.json({ user: { id: String(session.userId), email: session.email, name: session.name, role: session.role, platformAdmin: Boolean(user?.platformAdmin) }, tenant: tenant ? { id: String(tenant._id), ...tenant } : null })
+})
+
+app.delete('/api/workspace/account', async (req, res) => {
+  const session = requireSession(req, res)
+  if (!session) return
+  if (session.role !== 'OWNER') return res.status(403).json({ error: 'Only the workspace owner can delete this account.' })
+  const password = String(req.body?.password || '')
+  const confirmation = String(req.body?.confirmation || '').trim().toUpperCase()
+  if (confirmation !== 'DELETE MY WORKSPACE') return res.status(400).json({ error: 'Type DELETE MY WORKSPACE to confirm.' })
+  const db = await getDb()
+  const user = await db.collection('users').findOne({ _id: session.userId }, { projection: { passwordHash: 1 } })
+  if (!user?.passwordHash || !(await verifyPassword(password, String(user.passwordHash)))) return res.status(401).json({ error: 'Your password is incorrect.' })
+
+  const [memberships, verificationDocuments] = await Promise.all([
+    db.collection('tenantMemberships').find({ tenantId: session.tenantId }, { projection: { userId: 1 } }).toArray(),
+    db.collection('verificationDocuments').find({ tenantId: session.tenantId }, { projection: { fileId: 1 } }).toArray(),
+  ])
+  const requestedAt = new Date()
+  await db.collection('auditLogs').insertOne({ tenantId: session.tenantId, userId: session.userId, action: 'WORKSPACE_DELETION_STARTED', createdAt: requestedAt })
+  const bucket = new GridFSBucket(db, { bucketName: 'verificationFiles' })
+  for (const document of verificationDocuments) {
+    if (document.fileId instanceof ObjectId) await bucket.delete(document.fileId).catch(() => undefined)
+  }
+
+  const tenantCollections = ['whatsappConnections', 'whatsappConversations', 'whatsappMessages', 'processedWhatsAppEvents', 'verificationDocuments', 'paymentConnections', 'auditLogs']
+  await Promise.all(tenantCollections.map(collection => db.collection(collection).deleteMany({ tenantId: session.tenantId })))
+  await db.collection('tenantMemberships').deleteMany({ tenantId: session.tenantId })
+  const memberUserIds = memberships.map(membership => membership.userId).filter((id): id is ObjectId => id instanceof ObjectId)
+  const orphanedUserIds: ObjectId[] = []
+  for (const userId of memberUserIds) {
+    if (await db.collection('tenantMemberships').countDocuments({ userId }) === 0) orphanedUserIds.push(userId)
+  }
+  if (orphanedUserIds.length) await db.collection('users').deleteMany({ _id: { $in: orphanedUserIds }, platformAdmin: { $ne: true } })
+  await db.collection('tenants').deleteOne({ _id: session.tenantId })
+  await db.collection('privacyDeletionRecords').insertOne({ requestId: crypto.randomUUID(), tenantHash: crypto.createHash('sha256').update(String(session.tenantId)).digest('hex'), completedAt: new Date(), method: 'authenticated_owner_deletion' })
+  res.setHeader('Set-Cookie', expiredSessionCookie())
+  res.json({ ok: true, deleted: true })
 })
 
 app.put('/api/workspace/setup', async (req, res) => {
@@ -407,6 +459,11 @@ app.post('/api/workspace/inbox/:conversationId/reply', async (req, res) => {
   }
 })
 
+app.get(['/privacy', '/terms', '/data-deletion', '/acceptable-use', '/support'], (req, res) => {
+  const page = req.path.slice(1)
+  res.sendFile(path.join(projectDirectory, 'public', `${page}.html`))
+})
+
 app.get(['/register', '/login', '/app', '/admin'], (req, res) => {
   const page = req.path === '/register' ? 'register.html' : req.path === '/login' ? 'login.html' : req.path === '/admin' ? 'admin.html' : 'app.html'
   res.sendFile(path.join(projectDirectory, 'public', page))
@@ -489,7 +546,7 @@ function demoReply(conversation: Conversation, text: string) {
   const input = text.toLowerCase()
   if (conversation.stage === 'CONFIRMED' && input.includes('payment received')) return 'Payment received ✅ Your driving lesson is confirmed for Saturday at 11:00. We look forward to seeing you.'
   if (conversation.stage === 'PAYMENT_PENDING') {
-    const baseUrl = process.env.PUBLIC_API_URL || `http://localhost:${port}`
+    const baseUrl = publicApplicationUrl()
     if (input === 'pay_now' || input.includes('pay r450') || input.includes('pay now')) {
       return `Here is your secure payment link:\n${baseUrl}/pay/demo/${conversation.paymentReference}`
     }
@@ -519,7 +576,7 @@ function demoReply(conversation: Conversation, text: string) {
     conversation.paymentReference = reference
     conversation.paymentStatus = 'PENDING'
     conversation.bookingStatus = 'RESERVED'
-    const baseUrl = process.env.PUBLIC_API_URL || `http://localhost:${port}`
+    const baseUrl = publicApplicationUrl()
     addActivity('Booking created', `Driving Lesson reserved for Saturday at ${selectedTime}`)
     addActivity('Payment request created', 'R450 demo payment link sent')
     return `Perfect. I’ve reserved Saturday at ${selectedTime} for you.\n\nDriving Lesson — R450.00\n\nTap the secure payment link to confirm your booking:\n${baseUrl}/pay/demo/${reference}`
@@ -546,7 +603,7 @@ async function respondToCustomer(conversation: Conversation, text: string) {
   }
 }
 
-app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'afro-intelligent-whatsapp-api', release: serviceRelease }))
+app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'afro-intelligent-whatsapp', release: serviceRelease }))
 app.get('/readiness', (_req, res) => {
   const checks = {
     mongoConfigured: Boolean(process.env.MONGODB_URI || process.env.MONGO_URL || process.env.DATABASE_URL),
@@ -561,7 +618,7 @@ app.get('/readiness', (_req, res) => {
 
 app.get('/webhooks/whatsapp', (req, res) => {
   const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query
-  if (!mode && !token && !challenge) return res.json({ status: 'ready', service: 'afro-intelligent-whatsapp-api', message: 'Webhook is ready. Meta supplies verification parameters automatically.' })
+  if (!mode && !token && !challenge) return res.json({ status: 'ready', service: 'afro-intelligent-whatsapp', message: 'Webhook is ready. Meta supplies verification parameters automatically.' })
   if (mode === 'subscribe' && typeof token === 'string' && token === process.env.WHATSAPP_VERIFY_TOKEN && typeof challenge === 'string') return res.status(200).type('text/plain').send(challenge)
   return res.status(403).json({ error: 'Webhook verification failed' })
 })
@@ -571,12 +628,22 @@ app.post('/webhooks/whatsapp', async (req, res) => {
   res.status(200).json({ received: true })
   const values = req.body?.entry?.flatMap((entry: { changes?: Array<{ value?: unknown }> }) => entry.changes?.map(change => change.value) ?? []) ?? []
   for (const value of values) {
-    const webhookValue = value as { metadata?: { phone_number_id?: string }; messages?: Array<{ id?: string; from?: string; timestamp?: string; type?: string; text?: { body?: string }; interactive?: { button_reply?: { id?: string; title?: string } } }> }
+    const webhookValue = value as { metadata?: { phone_number_id?: string }; messages?: Array<{ id?: string; from?: string; timestamp?: string; type?: string; text?: { body?: string }; interactive?: { button_reply?: { id?: string; title?: string } } }>; statuses?: Array<{ id?: string; status?: string; timestamp?: string; recipient_id?: string; errors?: unknown[] }> }
     const connection = await getConnectionForPhoneId(webhookValue.metadata?.phone_number_id).catch(error => {
       console.error('Unable to resolve WhatsApp tenant connection:', error instanceof Error ? error.message : 'unknown error')
       return null
     })
     const messages = webhookValue.messages ?? []
+    if (connection) {
+      for (const status of webhookValue.statuses ?? []) {
+        if (!status.id || !status.status) continue
+        try {
+          await recordMessageStatus({ tenantId: connection.tenantId, metaMessageId: status.id, status: status.status, timestamp: status.timestamp ? new Date(Number(status.timestamp) * 1000).toISOString() : new Date().toISOString(), recipientId: status.recipient_id, errors: status.errors })
+        } catch (error) {
+          console.error('Unable to persist WhatsApp delivery status:', error instanceof Error ? error.message : 'unknown error')
+        }
+      }
+    }
     for (const incoming of messages) {
       if (!incoming.id || !incoming.from || processedMessageIds.has(incoming.id)) continue
       processedMessageIds.add(incoming.id)
@@ -705,6 +772,12 @@ if (process.env.LOCAL_FRONTEND_PROXY_ENABLED === 'true' && process.env.NODE_ENV 
   const frontendProxy = createProxyMiddleware({ target: process.env.FRONTEND_URL || 'http://localhost:3002', changeOrigin: true, ws: true, pathRewrite: (_path, req) => (req as unknown as { originalUrl?: string }).originalUrl ?? _path })
   app.use(['/whatsapp', '/_next', '/logo%20afrointelligent2.png', '/register', '/login', '/reset-password', '/api/auth', '/api/client'], frontendProxy)
 }
+
+app.use((error: Error, _req: Request, res: Response, _next: (error?: unknown) => void) => {
+  if (error.message === 'Origin is not allowed by CORS') return res.status(403).json({ error: 'Origin is not allowed.' })
+  console.error('Unhandled request error:', error.message)
+  return res.status(500).json({ error: 'Internal server error.' })
+})
 
 app.listen(port, () => {
   ensureWhatsappIndexes().catch(error => console.error('Unable to ensure WhatsApp indexes:', error instanceof Error ? error.message : 'unknown error'))

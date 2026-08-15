@@ -75,6 +75,24 @@ export async function recordOutboundMessage(input: { tenantId: ObjectId; convers
   if (input.conversationId) await db.collection('whatsappConversations').updateOne({ _id: input.conversationId, tenantId: input.tenantId }, { $set: { lastMessage: input.content, lastMessageAt: now, updatedAt: now } })
 }
 
+export async function recordMessageStatus(input: { tenantId: ObjectId; metaMessageId: string; status: string; timestamp: string; recipientId?: string; errors?: unknown[] }) {
+  const db = await getDb()
+  const status = input.status.toLowerCase()
+  const occurredAt = new Date(input.timestamp)
+  await db.collection('whatsappMessages').updateOne(
+    { tenantId: input.tenantId, metaMessageId: input.metaMessageId },
+    {
+      $set: {
+        deliveryStatus: status,
+        deliveryStatusAt: Number.isNaN(occurredAt.getTime()) ? new Date() : occurredAt,
+        recipientId: input.recipientId || null,
+        deliveryErrors: Array.isArray(input.errors) ? input.errors.slice(0, 5) : [],
+        updatedAt: new Date(),
+      },
+    },
+  )
+}
+
 export async function ensureWhatsappIndexes() {
   const db = await getDb()
   await Promise.all([
@@ -82,6 +100,7 @@ export async function ensureWhatsappIndexes() {
     db.collection('processedWhatsAppEvents').createIndex({ messageId: 1 }, { unique: true }),
     db.collection('whatsappConversations').createIndex({ tenantId: 1, customerPhone: 1 }, { unique: true }),
     db.collection('whatsappMessages').createIndex({ tenantId: 1, conversationId: 1, timestamp: -1 }),
+    db.collection('whatsappMessages').createIndex({ tenantId: 1, metaMessageId: 1 }),
     db.collection('verificationDocuments').createIndex({ tenantId: 1, uploadedAt: -1 }),
     ensureAuthIndexes(db),
   ])
