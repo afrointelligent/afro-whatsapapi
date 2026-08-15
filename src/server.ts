@@ -3,6 +3,7 @@ import crypto from 'node:crypto'
 import cors from 'cors'
 import express, { type Request, type Response } from 'express'
 import { createProxyMiddleware } from 'http-proxy-middleware'
+import { ensureWhatsappIndexes, getConnectionForPhoneId, recordWebhookMessage, type WhatsAppConnection } from './db.js'
 
 type AutomationMode = 'AI_ACTIVE' | 'HUMAN_ACTIVE'
 type StoredMessage = { id: string; direction: 'inbound' | 'outbound'; content: string; timestamp: string; type: string }
@@ -21,8 +22,17 @@ function addActivity(title: string, detail: string, tone: Activity['tone'] = 'in
   activities.splice(24)
 }
 
-app.use(cors({ origin: process.env.FRONTEND_URL?.split(',') ?? true }))
+const allowedOrigins = process.env.FRONTEND_URL?.split(',').map(origin => origin.trim()).filter(Boolean) ?? []
+app.use(cors({ origin: process.env.NODE_ENV === 'production' ? allowedOrigins : (allowedOrigins.length ? allowedOrigins : true) }))
 app.use(express.json({ verify: (req, _res, buf) => { (req as Request & { rawBody?: Buffer }).rawBody = buf } }))
+
+function requireInternalApi(req: Request, res: Response, next: () => void) {
+  if (process.env.NODE_ENV !== 'production') return next()
+  const key = process.env.INTERNAL_API_KEY
+  const received = req.header('authorization')?.replace(/^Bearer\s+/i, '')
+  if (!key || !received || received !== key) return res.status(404).end()
+  next()
+}
 
 function publicConversation(conversation: Conversation) {
   return { ...conversation, messages: conversation.messages.slice(-50) }
@@ -42,12 +52,14 @@ function validSignature(req: Request) {
   const received = req.header('x-hub-signature-256')
   if (!received || !(req as Request & { rawBody?: Buffer }).rawBody) return false
   const expected = `sha256=${crypto.createHmac('sha256', secret).update((req as Request & { rawBody: Buffer }).rawBody).digest('hex')}`
-  return crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected))
+  const actual = Buffer.from(received)
+  const wanted = Buffer.from(expected)
+  return actual.length === wanted.length && crypto.timingSafeEqual(actual, wanted)
 }
 
-export async function sendWhatsAppTextMessage(to: string, message: string) {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID
+export async function sendWhatsAppTextMessage(to: string, message: string, connection?: Pick<WhatsAppConnection, 'accessToken' | 'phoneNumberId'>) {
+  const token = connection?.accessToken || process.env.WHATSAPP_ACCESS_TOKEN
+  const phoneNumberId = connection?.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID
   if (!token || !phoneNumberId) throw new Error('WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID are required')
   const response = await fetch(`https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: to.replace(/\D/g, ''), type: 'text', text: { body: message } }) })
   const result = await response.json() as { error?: { message?: string }; messages?: Array<{ id: string }> }
@@ -148,25 +160,45 @@ app.post('/webhooks/whatsapp', async (req, res) => {
   res.status(200).json({ received: true })
   const values = req.body?.entry?.flatMap((entry: { changes?: Array<{ value?: unknown }> }) => entry.changes?.map(change => change.value) ?? []) ?? []
   for (const value of values) {
-    const messages = (value as { messages?: Array<{ id?: string; from?: string; timestamp?: string; type?: string; text?: { body?: string }; interactive?: { button_reply?: { id?: string; title?: string } } }> }).messages ?? []
+    const webhookValue = value as { metadata?: { phone_number_id?: string }; messages?: Array<{ id?: string; from?: string; timestamp?: string; type?: string; text?: { body?: string }; interactive?: { button_reply?: { id?: string; title?: string } } }> }
+    const connection = await getConnectionForPhoneId(webhookValue.metadata?.phone_number_id).catch(error => {
+      console.error('Unable to resolve WhatsApp tenant connection:', error instanceof Error ? error.message : 'unknown error')
+      return null
+    })
+    const messages = webhookValue.messages ?? []
     for (const incoming of messages) {
       if (!incoming.id || !incoming.from || processedMessageIds.has(incoming.id)) continue
       processedMessageIds.add(incoming.id)
       const content = incoming.text?.body ?? incoming.interactive?.button_reply?.id ?? incoming.interactive?.button_reply?.title
       if (!content) continue
+      if (!connection) {
+        console.error('Ignoring WhatsApp message because no connected tenant matches the recipient phone number')
+        continue
+      }
+      const durableEvent = await recordWebhookMessage({
+        tenantId: connection.tenantId,
+        messageId: incoming.id,
+        from: incoming.from,
+        content,
+        type: incoming.type ?? 'text',
+        timestamp: incoming.timestamp ? new Date(Number(incoming.timestamp) * 1000).toISOString() : new Date().toISOString(),
+      })
+      if (durableEvent.duplicate) continue
       const conversation = getConversation(incoming.from)
       conversation.unreadCount += 1
       conversation.lastMessageAt = new Date().toISOString()
       conversation.messages.push({ id: incoming.id, direction: 'inbound', type: incoming.type ?? 'text', content, timestamp: incoming.timestamp ?? conversation.lastMessageAt })
       addActivity('New WhatsApp enquiry', content.slice(0, 80))
       if (conversation.automationMode !== 'AI_ACTIVE') continue
-      try {
-        await respondToCustomer(conversation, content)
-      } catch (error) { console.error('Unable to send automatic WhatsApp reply:', error instanceof Error ? error.message : 'unknown error') }
+      // The old demo engine is intentionally not allowed to respond to a live
+      // tenant. Live replies are enabled only once a tenant-scoped flow engine
+      // is configured, preventing one business's rules from serving another.
+      console.info(`Persisted inbound WhatsApp message for tenant ${connection.tenantId.toString()}; automation awaits published tenant flow`)
     }
   }
 })
 
+app.use(['/api/conversations', '/api/dashboard'], requireInternalApi)
 app.get('/api/conversations', (_req, res) => res.json([...conversations.values()].sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt)).map(publicConversation)))
 app.delete('/api/conversations/:phone', (req, res) => {
   const conversation = conversations.get(req.params.phone)
@@ -226,9 +258,14 @@ app.post('/api/payments/:reference/complete', async (req, res) => {
   res.json({ status: 'PAID', bookingStatus: 'CONFIRMED' })
 })
 
-// Keep ngrok attached to this service for Meta, while also exposing the local product UI
-// through the same public domain during recording sessions.
-const frontendProxy = createProxyMiddleware({ target: process.env.FRONTEND_URL || 'http://localhost:3002', changeOrigin: true, ws: true, pathRewrite: (_path, req) => (req as unknown as { originalUrl?: string }).originalUrl ?? _path })
-app.use(['/whatsapp', '/_next', '/logo%20afrointelligent2.png', '/register', '/login', '/reset-password', '/api/auth', '/api/client'], frontendProxy)
+// Local demos can share an ngrok URL. Production Render must never proxy the
+// Vercel frontend or its authenticated routes.
+if (process.env.LOCAL_FRONTEND_PROXY_ENABLED === 'true' && process.env.NODE_ENV !== 'production') {
+  const frontendProxy = createProxyMiddleware({ target: process.env.FRONTEND_URL || 'http://localhost:3002', changeOrigin: true, ws: true, pathRewrite: (_path, req) => (req as unknown as { originalUrl?: string }).originalUrl ?? _path })
+  app.use(['/whatsapp', '/_next', '/logo%20afrointelligent2.png', '/register', '/login', '/reset-password', '/api/auth', '/api/client'], frontendProxy)
+}
 
-app.listen(port, () => console.log(`Afro Intelligent WhatsApp API listening on :${port}; webhook available at /webhooks/whatsapp`))
+app.listen(port, () => {
+  ensureWhatsappIndexes().catch(error => console.error('Unable to ensure WhatsApp indexes:', error instanceof Error ? error.message : 'unknown error'))
+  console.log(`Afro Intelligent WhatsApp API listening on :${port}; webhook available at /webhooks/whatsapp`)
+})
