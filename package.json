@@ -11,11 +11,13 @@
     "generate:verify-token": "node scripts/generate-verify-token.mjs"
   },
   "dependencies": {
+    "@types/multer": "^2.2.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "http-proxy-middleware": "^4.2.0",
-    "mongodb": "^6.21.0"
+    "mongodb": "^6.21.0",
+    "multer": "^2.2.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

@@ -1,0 +1,16 @@
+.connection-pill.docs-approved {
+  background: #e8f7ed;
+  color: #08783d;
+}
+
+.connection-pill.connected {
+  background: #d8f6e4;
+  color: #08783d;
+}
+
+@media (max-width: 560px) {
+  .connection-pill {
+    max-width: 100%;
+    line-height: 1.35;
+  }
+}

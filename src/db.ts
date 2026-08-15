@@ -1,4 +1,5 @@
 import { MongoClient, type Collection, type Db, type ObjectId } from 'mongodb'
+import { ensureAuthIndexes } from './auth.js'
 
 let clientPromise: Promise<MongoClient> | null = null
 
@@ -81,5 +82,7 @@ export async function ensureWhatsappIndexes() {
     db.collection('processedWhatsAppEvents').createIndex({ messageId: 1 }, { unique: true }),
     db.collection('whatsappConversations').createIndex({ tenantId: 1, customerPhone: 1 }, { unique: true }),
     db.collection('whatsappMessages').createIndex({ tenantId: 1, conversationId: 1, timestamp: -1 }),
+    db.collection('verificationDocuments').createIndex({ tenantId: 1, uploadedAt: -1 }),
+    ensureAuthIndexes(db),
   ])
 }

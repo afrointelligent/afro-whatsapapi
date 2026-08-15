@@ -1,0 +1,22 @@
+const submissionStyle = document.createElement('style')
+submissionStyle.textContent = `.submission-panel{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:18px 0;padding:16px;border:1px solid #bce6cd;border-radius:14px;background:#effbf3}.submission-panel b{display:block;color:#076c37;font-size:16px}.submission-panel p{margin:5px 0 0;color:#49685a;line-height:1.45}.submission-badge{border-radius:20px;background:#d4f7df;color:#08783d;padding:8px 10px;font-size:11px;font-weight:900;letter-spacing:.08em;white-space:nowrap}.submission-panel.needs-info{border-color:#f3cd79;background:#fff8e9}.submission-panel.needs-info b{color:#8a5900}.submission-panel.needs-info .submission-badge{background:#fff0c9;color:#8a5900}@media(max-width:600px){.submission-panel{align-items:flex-start;flex-direction:column}.submission-panel .button{width:100%;text-align:center}}`
+document.head.append(submissionStyle)
+
+async function refreshSubmissionPanel() {
+  const card = document.querySelector('.documents-card'); if (!card) return
+  let panel = document.querySelector('#verification-submission-panel')
+  if (!panel) { panel = document.createElement('section'); panel.id = 'verification-submission-panel'; panel.className = 'submission-panel'; card.querySelector('h3').insertAdjacentElement('afterend', panel) }
+  const response = await fetch('/api/workspace/verification'); if (!response.ok) return
+  const data = await response.json(), status = data.profile?.verificationSubmissionStatus
+  panel.className = 'submission-panel'
+  if (status === 'SUBMITTED_TO_META') { panel.innerHTML = '<div><b>Your verification pack has been submitted to Meta.</b><p>Meta is reviewing the information. We will update this page when Meta requests more information or confirms an outcome.</p></div><span class="submission-badge">WITH META</span>'; return }
+  if (status === 'APPROVED_FOR_META_ONBOARDING') { panel.innerHTML = '<div><b>Your documents have been approved by Afro Intelligent.</b><p>Your verification pack is ready for Meta onboarding. We will guide you through the next Meta step. Meta has not yet confirmed business verification.</p></div><span class="submission-badge">APPROVED FOR ONBOARDING</span>'; return }
+  if (status === 'MORE_INFORMATION_REQUIRED') { panel.classList.add('needs-info'); panel.innerHTML = '<div><b>More information is needed before Meta onboarding.</b><p>Please check the document review status and replace or update any item requested by Afro Intelligent.</p></div><span class="submission-badge">ACTION NEEDED</span>'; return }
+  if (status === 'SUBMITTED_FOR_REVIEW') { panel.innerHTML = '<div><b>Thanks — your verification pack has been submitted.</b><p>Afro Intelligent will review it and let you know if Meta needs more information. This has not been submitted to Meta yet.</p></div><span class="submission-badge">IN REVIEW</span>'; return }
+  panel.innerHTML = '<div><b>Ready to submit your verification pack?</b><p>When you are happy with your business information and documents, submit them to Afro Intelligent for review.</p></div><button class="button button-primary" id="submit-verification-pack" type="button">Submit for review →</button>'
+  const button = panel.querySelector('#submit-verification-pack')
+  button?.addEventListener('click', async () => { button.disabled = true; button.textContent = 'Submitting…'; const submit = await fetch('/api/workspace/verification/submit', { method: 'POST' }); const result = await submit.json().catch(() => ({})); if (!submit.ok) { alert(result.error || 'We could not submit your verification pack.'); button.disabled = false; button.textContent = 'Submit for review →'; return }; refreshSubmissionPanel() })
+}
+
+document.addEventListener('DOMContentLoaded', refreshSubmissionPanel)
+window.addEventListener('hashchange', () => { if (location.hash === '#setup') refreshSubmissionPanel() })
