@@ -147,6 +147,17 @@ async function respondToCustomer(conversation: Conversation, text: string) {
 }
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', service: 'afro-intelligent-whatsapp-api' }))
+app.get('/readiness', (_req, res) => {
+  const checks = {
+    mongoConfigured: Boolean(process.env.MONGODB_URI || process.env.DATABASE_URL),
+    webhookVerifyTokenConfigured: Boolean(process.env.WHATSAPP_VERIFY_TOKEN),
+    webhookSignatureConfigured: Boolean(process.env.META_APP_SECRET),
+    testPhoneConfigured: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN),
+    internalApiProtected: Boolean(process.env.INTERNAL_API_KEY),
+  }
+  const ready = Object.values(checks).every(Boolean)
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', checks })
+})
 
 app.get('/webhooks/whatsapp', (req, res) => {
   const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query
