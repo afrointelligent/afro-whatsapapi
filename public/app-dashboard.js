@@ -46,6 +46,24 @@ function renderVerificationStep() { const form = document.querySelector('#verifi
 function validVerificationStep() { const current = verificationSteps[verificationStep]; for (const name of current.fields) { const field = document.querySelector(`#verification-profile-form [name="${name}"]`); if (field.required && !field.value.trim()) { field.focus(); return false } if (field.type === 'email' && field.value && !field.checkValidity()) { field.focus(); return false } } return true }
 async function loadVerification() { const response = await fetch('/api/workspace/verification'); if (!response.ok) return; verification = await response.json(); const form = document.querySelector('#verification-profile-form'); for (const [key, value] of Object.entries(verification.profile || {})) { const field = form.elements.namedItem(key); if (field && typeof value === 'string') field.value = value }; renderReadiness(document.querySelector('#readiness-list'), verification.readiness); renderReadiness(document.querySelector('#connection-checklist'), verification.readiness); const connectionText=document.querySelector('#connection-readiness'),reviewStatus=verification.profile?.verificationSubmissionStatus,approved=['APPROVED_FOR_META_ONBOARDING','SUBMITTED_TO_META'].includes(reviewStatus),connected=verification.connection?.connected; connectionText.className=approved?'connection-approved':''; connectionText.textContent=connected?'Your Meta Business and WhatsApp number are securely connected.':approved?'Your business has been approved for onboarding. Connect your WhatsApp Business account to continue.':reviewStatus==='MORE_INFORMATION_REQUIRED'?'AfroIntelligent needs more information before onboarding can be approved.':'Your application is under review by AfroIntelligent. WhatsApp connection becomes available after internal approval.'; const details=document.querySelector('#whatsapp-connection-details');details.innerHTML=connected?`<div><b>Meta Business Connection</b><span class="ready">Connected</span></div><div><b>WhatsApp Number</b><span class="ready">Connected</span></div><div><b>Phone Number</b><span>${escapeHtml(verification.connection.displayPhoneNumber||'Connected')}</span></div><div><b>WABA</b><span class="ready">Connected</span></div>`:'';document.querySelector('#connect-whatsapp').hidden=!verification.canConnectWhatsApp;document.querySelector('#complete-onboarding').hidden=verification.canConnectWhatsApp||connected;updateConnectionPill(reviewStatus,connected);renderDocuments() }
 
+const loadVerificationBase = loadVerification
+loadVerification = async function () {
+  await loadVerificationBase()
+  const heading = document.querySelector('.verification-card h2')
+  const introduction = document.querySelector('.verification-card > p')
+  const documentsHeading = document.querySelector('.documents-card h3')
+  const documentsIntroduction = document.querySelector('.documents-card > p')
+  if (heading) heading.textContent = 'Complete your business profile.'
+  if (introduction) introduction.textContent = 'Your basic business profile enables WhatsApp Business connection. Supporting documents are optional, reviewed only by AfroIntelligent for internal purposes, and never automatically submitted to Meta.'
+  if (documentsHeading) documentsHeading.textContent = 'Optional business documents'
+  if (documentsIntroduction) documentsIntroduction.textContent = 'Uploading documents is optional and never required to connect WhatsApp Business. Files are private to your workspace, reviewed only by AfroIntelligent for internal purposes, not automatically submitted to Meta, and never sent to AI.'
+  const connected = Boolean(verification.connection?.connected)
+  const profileComplete = Boolean(verification.readiness?.businessProfile)
+  const connectionText = document.querySelector('#connection-readiness')
+  connectionText.className = profileComplete ? 'connection-approved' : ''
+  connectionText.textContent = connected ? 'Your Meta Business and WhatsApp number are securely connected.' : profileComplete ? 'Your business profile is complete. You can connect your WhatsApp Business account directly with Meta. Optional document status does not affect this connection.' : 'Complete your basic business profile to connect WhatsApp Business. Documents are optional.'
+}
+
 function updateConnectionPill(reviewStatus, connected) {
   const pill = document.querySelector('.connection-pill')
   if (!pill) return

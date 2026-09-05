@@ -10,6 +10,7 @@ import multer from 'multer'
 import nodemailer from 'nodemailer'
 import { ensureWhatsappIndexes, getConnectionForPhoneId, getDb, getMongoClient, recordMessageStatus, recordOutboundMessage, recordWebhookMessage, type WhatsAppConnection } from './db.js'
 import { consumePasswordResetToken, createPasswordResetToken, expiredSessionCookie, loginUser, readCookie, readSession, registerOwner, sessionCookie, signSession, verifyPassword } from './auth.js'
+import { canLaunchEmbeddedSignup, hasConnectableBusinessProfile } from './onboarding.js'
 
 type AutomationMode = 'AI_ACTIVE' | 'HUMAN_ACTIVE'
 type StoredMessage = { id: string; direction: 'inbound' | 'outbound'; content: string; timestamp: string; type: string }
@@ -484,17 +485,17 @@ app.get('/api/workspace/verification', async (req, res) => {
     db.collection<WhatsAppConnection>('whatsappConnections').findOne({ tenantId: session.tenantId, status: 'CONNECTED' }, { projection: { tenantId: 1, phoneNumberId: 1, wabaId: 1, businessId: 1, displayPhoneNumber: 1, verifiedName: 1, connectionType: 1, status: 1, onboardingStatus: 1 } }),
   ])
   const profile = (tenant || {}) as Record<string, any>
-  const businessProfileComplete = Boolean(profile.legalBusinessName && profile.displayName && profile.industry && (profile.businessDescription || profile.workspaceSetup?.businessDescription))
-  const documentReadiness = ['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(profile.verificationSubmissionStatus) ? 'APPROVED' : profile.verificationSubmissionStatus === 'MORE_INFORMATION_REQUIRED' ? 'MORE_INFORMATION_NEEDED' : profile.verificationSubmissionStatus === 'SUBMITTED_FOR_REVIEW' ? 'UNDER_AFROINTELLIGENT_REVIEW' : documents.length ? 'READY_FOR_AFROINTELLIGENT_REVIEW' : 'MORE_INFORMATION_NEEDED'
-  const readiness = { businessProfile: businessProfileComplete, businessEmail: Boolean(profile.businessEmail), businessWebsite: Boolean(profile.website), businessAddress: Boolean(profile.registeredAddress), phoneNumber: Boolean(profile.businessPhone), afroIntelligentReview: documentReadiness, metaBusinessConnection: connection ? 'CONNECTED' : 'NOT_CONNECTED', whatsappNumber: connection ? 'CONNECTED' : 'NOT_CONNECTED' }
-  res.json({ profile, documents: documents.map(document => ({ id: String(document._id), type: document.type, filename: document.filename, purpose: document.purpose, status: document.status, uploadedAt: document.uploadedAt })), readiness, connection: connection ? { connected: true, businessId: connection.businessId || null, wabaId: connection.wabaId || null, phoneNumberId: connection.phoneNumberId, displayPhoneNumber: connection.displayPhoneNumber || null, verifiedName: connection.verifiedName || null, onboardingStatus: connection.onboardingStatus || 'CONNECTED' } : { connected: false }, canConnectWhatsApp: ['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(profile.verificationSubmissionStatus) && !connection, canManage: canManageVerification(session) })
+  const businessProfileComplete = hasConnectableBusinessProfile(profile)
+  const documentReadiness = documents.length ? (profile.verificationSubmissionStatus === 'MORE_INFORMATION_REQUIRED' ? 'INTERNAL_FOLLOW_UP' : profile.verificationSubmissionStatus === 'SUBMITTED_FOR_REVIEW' ? 'UNDER_OPTIONAL_REVIEW' : 'OPTIONAL_DOCUMENTS_UPLOADED') : 'OPTIONAL_NOT_PROVIDED'
+  const readiness = { businessProfile: businessProfileComplete, optionalDocuments: documentReadiness, metaBusinessConnection: connection ? 'CONNECTED' : 'NOT_CONNECTED', whatsappNumber: connection ? 'CONNECTED' : 'NOT_CONNECTED' }
+  res.json({ profile, documents: documents.map(document => ({ id: String(document._id), type: document.type, filename: document.filename, purpose: document.purpose, status: document.status, uploadedAt: document.uploadedAt })), readiness, connection: connection ? { connected: true, businessId: connection.businessId || null, wabaId: connection.wabaId || null, phoneNumberId: connection.phoneNumberId, displayPhoneNumber: connection.displayPhoneNumber || null, verifiedName: connection.verifiedName || null, onboardingStatus: connection.onboardingStatus || 'CONNECTED' } : { connected: false }, canConnectWhatsApp: canLaunchEmbeddedSignup(profile, Boolean(connection)), canManage: canManageVerification(session) })
 })
 
 app.get('/api/workspace/whatsapp/embedded-signup-config', async (req, res) => {
   const session = requireSession(req, res)
   if (!session) return
-  const tenant = await (await getDb()).collection('tenants').findOne({ _id: session.tenantId }, { projection: { verificationSubmissionStatus: 1 } })
-  if (!['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(String(tenant?.verificationSubmissionStatus))) return res.status(403).json({ error: 'AfroIntelligent onboarding approval is required before connecting WhatsApp Business.' })
+  const tenant = await (await getDb()).collection('tenants').findOne({ _id: session.tenantId })
+  if (!hasConnectableBusinessProfile(tenant)) return res.status(403).json({ error: 'Complete your basic business profile before connecting WhatsApp Business.' })
   const appId = process.env.META_APP_ID
   const configId = process.env.META_EMBEDDED_SIGNUP_CONFIG_ID
   if (!appId || !configId || !process.env.META_APP_SECRET) return res.status(503).json({ error: 'WhatsApp Business connection setup is not available yet.' })
@@ -511,8 +512,8 @@ app.post('/api/workspace/whatsapp/embedded-signup/complete', async (req, res) =>
   const businessId = String(req.body?.businessId || '')
   if (!code || !/^\d+$/.test(wabaId) || !/^\d+$/.test(phoneNumberId) || (businessId && !/^\d+$/.test(businessId))) return res.status(400).json({ error: 'Meta did not return a complete WhatsApp Business connection.' })
   const db = await getDb()
-  const tenant = await db.collection('tenants').findOne({ _id: session.tenantId }, { projection: { verificationSubmissionStatus: 1 } })
-  if (!['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(String(tenant?.verificationSubmissionStatus))) return res.status(403).json({ error: 'AfroIntelligent onboarding approval is required before connecting WhatsApp Business.' })
+  const tenant = await db.collection('tenants').findOne({ _id: session.tenantId })
+  if (!hasConnectableBusinessProfile(tenant)) return res.status(403).json({ error: 'Complete your basic business profile before connecting WhatsApp Business.' })
   const appId = process.env.META_APP_ID
   const appSecret = process.env.META_APP_SECRET
   if (!appId || !appSecret) return res.status(503).json({ error: 'Meta connection credentials are not configured.' })
@@ -542,7 +543,7 @@ app.post('/api/workspace/verification/submit', async (req, res) => {
   if (!session) return
   if (!canManageVerification(session)) return res.status(403).json({ error: 'Only workspace owners and administrators can submit a verification pack.' })
   const db = await getDb(); const [tenant, count] = await Promise.all([db.collection('tenants').findOne({ _id: session.tenantId }), db.collection('verificationDocuments').countDocuments({ tenantId: session.tenantId })])
-  if (!tenant?.legalBusinessName || !tenant?.displayName || !tenant?.businessEmail || !tenant?.businessPhone || !tenant?.registeredAddress || !count) return res.status(400).json({ error: 'Complete your business profile and upload at least one verification document before submitting for review.' })
+  if (!hasConnectableBusinessProfile(tenant) || !count) return res.status(400).json({ error: 'Complete your business profile and upload at least one optional document before submitting those documents for AfroIntelligent review.' })
   const now = new Date()
   await Promise.all([
     db.collection('tenants').updateOne({ _id: session.tenantId }, { $set: { verificationSubmissionStatus: 'SUBMITTED_FOR_REVIEW', verificationSubmittedAt: now, updatedAt: now } }),
@@ -619,14 +620,23 @@ app.get('/api/admin/verification-documents', async (req, res) => {
     { $unwind: { path: '$connection', preserveNullAndEmptyArrays: true } },
     { $project: { filename: 1, type: 1, purpose: 1, status: 1, uploadedAt: 1, tenantId: 1, tenantName: '$tenant.name', tenantEmail: '$tenant.businessEmail', tenantVerificationStatus: '$tenant.verificationSubmissionStatus', legalBusinessName: '$tenant.legalBusinessName', displayName: '$tenant.displayName', industry: '$tenant.industry', businessPhone: '$tenant.businessPhone', website: '$tenant.website', registeredAddress: '$tenant.registeredAddress', metaConnectionStatus: { $ifNull: ['$connection.status', 'NOT_CONNECTED'] }, wabaConnected: { $cond: [{ $ifNull: ['$connection.wabaId', false] }, true, false] }, displayPhoneNumber: { $ifNull: ['$connection.displayPhoneNumber', null] } } },
   ]).toArray()
+  const documentedTenantIds = documents.map(document => document.tenantId)
+  const tenantsWithoutDocuments = await db.collection('tenants').aggregate([
+    { $match: documentedTenantIds.length ? { _id: { $nin: documentedTenantIds } } : {} },
+    { $sort: { updatedAt: -1 } }, { $limit: 300 },
+    { $lookup: { from: 'whatsappConnections', let: { tenantId: '$_id' }, pipeline: [{ $match: { $expr: { $and: [{ $eq: ['$tenantId', '$$tenantId'] }, { $eq: ['$status', 'CONNECTED'] }] } } }, { $project: { wabaId: 1, displayPhoneNumber: 1, status: 1 } }, { $limit: 1 }], as: 'connection' } },
+    { $unwind: { path: '$connection', preserveNullAndEmptyArrays: true } },
+    { $project: { tenantId: '$_id', tenantName: '$name', tenantEmail: '$businessEmail', tenantVerificationStatus: '$verificationSubmissionStatus', legalBusinessName: 1, displayName: 1, industry: 1, businessPhone: 1, website: 1, registeredAddress: 1, metaConnectionStatus: { $ifNull: ['$connection.status', 'NOT_CONNECTED'] }, wabaConnected: { $cond: [{ $ifNull: ['$connection.wabaId', false] }, true, false] }, displayPhoneNumber: { $ifNull: ['$connection.displayPhoneNumber', null] } } },
+  ]).toArray()
+  documents.push(...tenantsWithoutDocuments)
   const summary = {
-    total: documents.length,
+    total: documents.filter(document => document._id).length,
     approved: new Set(documents.filter(document => ['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(document.tenantVerificationStatus)).map(document => String(document.tenantId))).size,
     replacementRequired: documents.filter(document => document.status === 'REPLACEMENT_REQUIRED').length,
     underReview: new Set(documents.filter(document => document.tenantVerificationStatus === 'SUBMITTED_FOR_REVIEW').map(document => String(document.tenantId))).size,
     businesses: new Set(documents.map(document => String(document.tenantId))).size
   }
-  res.json({ summary, documents: documents.map(document => ({ id: String(document._id), tenantId: String(document.tenantId), tenantName: document.tenantName, tenantEmail: document.tenantEmail, tenantVerificationStatus: document.tenantVerificationStatus, profile: { legalBusinessName: document.legalBusinessName || null, displayName: document.displayName || null, industry: document.industry || null, businessEmail: document.tenantEmail || null, businessPhone: document.businessPhone || null, website: document.website || null, registeredAddress: document.registeredAddress || null }, connection: { status: document.metaConnectionStatus, wabaConnected: Boolean(document.wabaConnected), displayPhoneNumber: document.displayPhoneNumber || null }, filename: document.filename, type: document.type, purpose: document.purpose, status: document.status, uploadedAt: document.uploadedAt })) })
+  res.json({ summary, documents: documents.map(document => ({ id: document._id ? String(document._id) : null, tenantId: String(document.tenantId), tenantName: document.tenantName, tenantEmail: document.tenantEmail, tenantVerificationStatus: document.tenantVerificationStatus, profile: { legalBusinessName: document.legalBusinessName || null, displayName: document.displayName || null, industry: document.industry || null, businessEmail: document.tenantEmail || null, businessPhone: document.businessPhone || null, website: document.website || null, registeredAddress: document.registeredAddress || null }, connection: { status: document.metaConnectionStatus, wabaConnected: Boolean(document.wabaConnected), displayPhoneNumber: document.displayPhoneNumber || null }, filename: document.filename || null, type: document.type || null, purpose: document.purpose || null, status: document.status || 'OPTIONAL_NOT_PROVIDED', uploadedAt: document.uploadedAt || null })) })
 })
 
 app.patch('/api/admin/verification-documents/:documentId', async (req, res) => {

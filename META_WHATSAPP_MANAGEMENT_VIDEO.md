@@ -13,19 +13,15 @@ Purpose: demonstrate the real reviewer-visible use of `whatsapp_business_managem
 ## Script
 
 1. Open the AfroIntelligent client workspace.
-2. Open **Business Setup** and briefly show: “Your information and documents are submitted to AfroIntelligent for internal review and onboarding” and “These documents are not automatically submitted to Meta.”
-3. Show the submitted business information and safe review document.
-4. Open the AfroIntelligent platform-admin review centre.
-5. Show the business profile summary and that Meta/WABA/WhatsApp are not connected.
-6. Mark the document reviewed. Point out that this does not approve the business.
-7. Separately click **Approve business onboarding**.
-8. Return to the client workspace and show **AfroIntelligent Review: Approved** while Meta and WhatsApp remain **Not Connected**.
-9. Click **Connect WhatsApp Business**.
-10. Show the real Meta Embedded Signup window. Authenticate directly with Meta without exposing credentials.
-11. Select the review WhatsApp Business Account and eligible phone number, then authorize AfroIntelligent.
-12. After returning to AfroIntelligent, show **Meta Business Connection: Connected**, **WhatsApp Number: Connected**, the display phone number, and **WABA: Connected**.
-13. Return briefly to the admin review centre and show the connected status and display phone number for the same workspace.
-14. Stop recording.
+2. Open **Business Setup**, complete the basic business profile, and show that documents are explicitly optional and are not automatically submitted to Meta.
+3. Leave the workspace with zero uploaded documents to demonstrate that documents are not a connection prerequisite.
+4. Open **Messaging Connection** and show Meta/WABA/WhatsApp as **Not Connected** and the available **Connect WhatsApp Business** button.
+5. Click **Connect WhatsApp Business**.
+6. Show the real Meta Embedded Signup window. Authenticate directly with Meta without exposing credentials.
+7. Select or create the review WhatsApp Business Account and select its eligible phone number, then authorize AfroIntelligent. Meta handles its own verification and authorization requirements.
+8. After returning to AfroIntelligent, show **Meta Business Connection: Connected**, **WhatsApp Number: Connected**, the display phone number, and **WABA: Connected**.
+9. Return briefly to the admin review centre and show the connection status and display phone number for the same workspace. If optional documents exist, explain that their internal review status is independent of the Meta connection.
+10. Stop recording.
 
 ## Reviewer explanation
 
@@ -33,7 +29,7 @@ AfroIntelligent uses `whatsapp_business_management` only after the client authen
 
 ## Do not claim or show
 
-- Do not describe AfroIntelligent's internal document review as Meta verification or Meta approval.
+- Do not describe AfroIntelligent's optional internal document review as Meta verification, Meta approval, or a prerequisite for Embedded Signup.
 - Do not claim documents are uploaded or submitted to Meta.
 - Do not claim message-template, Facebook Page, Instagram, Ads, or unrelated asset management.
 - Do not expose WABA tokens, authorization codes, app secrets, encryption keys, passwords, or session cookies.

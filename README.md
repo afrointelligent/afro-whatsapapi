@@ -19,7 +19,7 @@ Run `npm install`, then `npm run dev`, and open `http://localhost:3001`. A tempo
 
 Incoming message IDs are durably deduplicated in MongoDB. Incoming messages and delivery statuses are tenant-scoped by the recipient WhatsApp phone-number ID. POST webhook payloads require a valid `X-Hub-Signature-256` generated with `META_APP_SECRET` in production.
 
-Client onboarding has two separate stages. Business information and documents are submitted to AfroIntelligent for internal review only. After explicit internal approval, the client uses Meta Embedded Signup to authorize a WABA and WhatsApp phone number directly with Meta. The backend validates the selected phone against the authorized WABA, subscribes the app to webhook events, and stores the customer token encrypted with `CREDENTIAL_ENCRYPTION_KEY`.
+Client onboarding starts with a basic business profile. Supporting documents are optional and, when uploaded, are reviewed by AfroIntelligent only for internal purposes. A complete profile can launch Meta Embedded Signup without documents or internal document approval. Meta handles its own authorization and verification. The backend validates the selected phone against the authorized WABA, subscribes the app to webhook events, and stores the customer token encrypted with `CREDENTIAL_ENCRYPTION_KEY`.
 
 Production Embedded Signup requires `META_APP_ID`, `META_APP_SECRET`, `META_EMBEDDED_SIGNUP_CONFIG_ID`, and an independent 32+ character `CREDENTIAL_ENCRYPTION_KEY`. `/readiness` reports only whether these values are configured; it never returns their values.
 

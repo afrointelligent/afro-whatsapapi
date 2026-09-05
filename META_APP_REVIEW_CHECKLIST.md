@@ -5,9 +5,9 @@
 - [ ] `/health` returns `status: ok` and `service: afro-intelligent-whatsapp`.
 - [ ] `/readiness` reports `embeddedSignupConfigured: true` and `credentialEncryptionKeyConfigured: true` without returning configuration values.
 - [ ] A client submission is clearly described as an AfroIntelligent internal review and is not presented as a Meta application.
-- [ ] Reviewing one document does not approve the overall business.
-- [ ] The platform admin explicitly approves the business for onboarding.
-- [ ] The approved client sees **Connect WhatsApp Business**.
+- [ ] A client with a complete basic profile and zero documents sees **Connect WhatsApp Business**.
+- [ ] Missing, pending, or rejected optional documents do not block Embedded Signup.
+- [ ] Document review remains an internal AfroIntelligent process independent from Meta connection status.
 - [ ] Meta Embedded Signup opens and the client authenticates directly with Meta.
 - [ ] Cancelling Embedded Signup leaves the workspace unconnected.
 - [ ] Successful signup validates the selected phone against the authorized WABA and subscribes the app to WABA webhooks.
