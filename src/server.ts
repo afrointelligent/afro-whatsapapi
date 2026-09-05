@@ -307,9 +307,13 @@ app.put('/api/workspace/setup', async (req, res) => {
   const hours = String(req.body?.hours || '').trim()
   if (!businessDescription || !services.length || !hours) return res.status(400).json({ error: 'Add a short description, at least one service, and your business hours.' })
   const now = new Date()
+  const [tenant, user] = await Promise.all([
+    (await getDb()).collection('tenants').findOne({ _id: session.tenantId }, { projection: { name: 1, legalBusinessName: 1, displayName: 1, businessEmail: 1 } }),
+    (await getDb()).collection('users').findOne({ _id: session.userId }, { projection: { email: 1 } }),
+  ])
   await (await getDb()).collection('tenants').updateOne(
     { _id: session.tenantId },
-    { $set: { workspaceSetup: { businessDescription, services, hours, completedAt: now }, updatedAt: now } },
+    { $set: { workspaceSetup: { businessDescription, services, hours, completedAt: now }, legalBusinessName: tenant?.legalBusinessName || tenant?.name, displayName: tenant?.displayName || tenant?.name, businessEmail: tenant?.businessEmail || user?.email, updatedAt: now } },
   )
   await (await getDb()).collection('auditLogs').insertOne({ tenantId: session.tenantId, userId: session.userId, action: 'BUSINESS_SETUP_COMPLETED', createdAt: now })
   res.json({ ok: true })
