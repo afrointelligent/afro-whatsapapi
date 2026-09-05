@@ -7,8 +7,9 @@ import { fileURLToPath } from 'node:url'
 import { createProxyMiddleware } from 'http-proxy-middleware'
 import { GridFSBucket, ObjectId } from 'mongodb'
 import multer from 'multer'
+import nodemailer from 'nodemailer'
 import { ensureWhatsappIndexes, getConnectionForPhoneId, getDb, recordMessageStatus, recordOutboundMessage, recordWebhookMessage, type WhatsAppConnection } from './db.js'
-import { expiredSessionCookie, loginUser, readCookie, readSession, registerOwner, sessionCookie, signSession, verifyPassword } from './auth.js'
+import { consumePasswordResetToken, createPasswordResetToken, expiredSessionCookie, loginUser, readCookie, readSession, registerOwner, sessionCookie, signSession, verifyPassword } from './auth.js'
 
 type AutomationMode = 'AI_ACTIVE' | 'HUMAN_ACTIVE'
 type StoredMessage = { id: string; direction: 'inbound' | 'outbound'; content: string; timestamp: string; type: string }
@@ -52,6 +53,46 @@ function encryptCredential(value: string) {
 function credentialHint(value: string) {
   const clean = value.trim()
   return clean.length <= 4 ? 'Configured' : `Ends in ${clean.slice(-4)}`
+}
+
+const forgotPasswordMessage = 'If an account exists for that email, we’ve sent password reset instructions.'
+
+function passwordResetTransport() {
+  const host = process.env.SMTP_HOST
+  const user = process.env.SMTP_USER
+  const pass = process.env.SMTP_PASS
+  if (!host || !user || !pass) throw new Error('SMTP email delivery is not configured.')
+  const port = Number(process.env.SMTP_PORT || 465)
+  return nodemailer.createTransport({ host, port, secure: port === 465, auth: { user, pass } })
+}
+
+async function passwordResetAllowed(db: Awaited<ReturnType<typeof getDb>>, email: string, ip: string) {
+  const now = new Date()
+  const expiresAt = new Date(now.getTime() + 15 * 60 * 1000)
+  const keys = [`email:${email}`, `ip:${ip}`].map(value => crypto.createHash('sha256').update(value).digest('hex'))
+  for (const key of keys) {
+    const current = await db.collection('passwordResetRateLimits').findOne({ key })
+    if (!current || current.expiresAt <= now) {
+      await db.collection('passwordResetRateLimits').updateOne({ key }, { $set: { count: 1, expiresAt, updatedAt: now } }, { upsert: true })
+      continue
+    }
+    const updated = await db.collection('passwordResetRateLimits').findOneAndUpdate({ key, expiresAt: { $gt: now } }, { $inc: { count: 1 }, $set: { updatedAt: now } }, { returnDocument: 'after' })
+    if (Number(updated?.count || 0) > 5) return false
+  }
+  return true
+}
+
+async function sendPasswordResetEmail(email: string, firstName: string | undefined, token: string) {
+  const baseUrl = publicApplicationUrl().replace(/\/$/, '')
+  const resetUrl = `${baseUrl}/reset-password?token=${encodeURIComponent(token)}`
+  const from = process.env.SMTP_FROM || process.env.FROM_EMAIL || process.env.SMTP_USER
+  await passwordResetTransport().sendMail({
+    from,
+    to: email,
+    subject: 'Reset your AfroIntelligent password',
+    text: `Hello${firstName ? ` ${firstName}` : ''},\n\nUse this link to reset your AfroIntelligent password. It expires in 45 minutes and can be used once:\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email.`,
+    html: `<p>Hello${firstName ? ` ${firstName}` : ''},</p><p>Use the button below to reset your AfroIntelligent password. This link expires in 45 minutes and can be used once.</p><p><a href="${resetUrl}" style="display:inline-block;padding:12px 18px;border-radius:999px;background:#168e4c;color:#fff;text-decoration:none;font-weight:700">Reset password</a></p><p>If you did not request this, you can ignore this email.</p>`,
+  })
 }
 
 const configuredOrigins = process.env.FRONTEND_URL?.split(',').map(origin => origin.trim().replace(/\/$/, '')).filter(Boolean) ?? []
@@ -128,6 +169,42 @@ app.post('/api/auth/login', async (req, res) => {
 })
 
 app.post('/api/auth/logout', (_req, res) => { res.setHeader('Set-Cookie', expiredSessionCookie()); res.status(204).end() })
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase()
+  res.status(202)
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.json({ message: forgotPasswordMessage })
+  try {
+    const db = await getDb()
+    if (!(await passwordResetAllowed(db, email, req.ip || req.socket.remoteAddress || 'unknown'))) return res.json({ message: forgotPasswordMessage })
+    const reset = await createPasswordResetToken(db, email)
+    if (reset) {
+      try { await sendPasswordResetEmail(reset.user.email, reset.user.firstName, reset.token) }
+      catch (error) {
+        await db.collection('passwordResetTokens').updateOne({ tokenHash: reset.tokenHash }, { $set: { usedAt: new Date(), invalidatedReason: 'delivery_failed' } })
+        console.error('Password reset email delivery failed:', error instanceof Error ? error.message : 'unknown error')
+      }
+    }
+  } catch (error) {
+    console.error('Password reset request failed:', error instanceof Error ? error.message : 'unknown error')
+  }
+  res.json({ message: forgotPasswordMessage })
+})
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const token = String(req.body?.token || '')
+  const password = String(req.body?.password || '')
+  const confirmPassword = String(req.body?.confirmPassword || '')
+  if (password !== confirmPassword) return res.status(400).json({ error: 'Passwords do not match.' })
+  try {
+    const changed = await consumePasswordResetToken(await getDb(), token, password)
+    if (!changed) return res.status(400).json({ error: 'This reset link is invalid, expired, or has already been used.' })
+    res.setHeader('Set-Cookie', expiredSessionCookie())
+    res.json({ ok: true, redirectTo: '/login?passwordReset=1' })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Password could not be reset.'
+    res.status(message.includes('12 characters') ? 400 : 503).json({ error: message })
+  }
+})
 app.get('/api/auth/me', async (req, res) => {
   const session = requireSession(req, res)
   if (!session) return
@@ -515,8 +592,8 @@ app.get(['/privacy', '/terms', '/data-deletion', '/acceptable-use', '/support'],
   res.sendFile(path.join(projectDirectory, 'public', `${page}.html`))
 })
 
-app.get(['/register', '/login', '/app', '/admin'], (req, res) => {
-  const page = req.path === '/register' ? 'register.html' : req.path === '/login' ? 'login.html' : req.path === '/admin' ? 'admin.html' : 'app.html'
+app.get(['/register', '/login', '/forgot-password', '/reset-password', '/app', '/admin'], (req, res) => {
+  const page = req.path === '/register' ? 'register.html' : req.path === '/login' ? 'login.html' : req.path === '/forgot-password' ? 'forgot-password.html' : req.path === '/reset-password' ? 'reset-password.html' : req.path === '/admin' ? 'admin.html' : 'app.html'
   res.sendFile(path.join(projectDirectory, 'public', page))
 })
 

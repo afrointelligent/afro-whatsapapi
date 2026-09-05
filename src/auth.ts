@@ -15,6 +15,7 @@ type UserDocument = {
   lastName: string
   email: string
   passwordHash: string
+  passwordUpdatedAt?: Date
   platformAdmin?: boolean
   status: 'ACTIVE' | 'SUSPENDED'
   createdAt: Date
@@ -43,6 +44,42 @@ export async function verifyPassword(password: string, stored: string) {
   const derived = await scrypt(password, salt, 64) as Buffer
   const expected = Buffer.from(hash, 'hex')
   return expected.length === derived.length && crypto.timingSafeEqual(expected, derived)
+}
+
+export function validatePassword(password: string) {
+  if (password.length < 12) throw new Error('Use a password with at least 12 characters.')
+}
+
+export async function createPasswordResetToken(db: Db, emailInput: string) {
+  const email = emailInput.trim().toLowerCase()
+  const user = await db.collection<UserDocument>('users').findOne({ email, status: 'ACTIVE' }, { projection: { _id: 1, email: 1, firstName: 1 } })
+  if (!user) return null
+  const token = crypto.randomBytes(32).toString('base64url')
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
+  const now = new Date()
+  const expiresAt = new Date(now.getTime() + 45 * 60 * 1000)
+  await db.collection('passwordResetTokens').updateMany({ userId: user._id, usedAt: null }, { $set: { usedAt: now, invalidatedReason: 'replaced' } })
+  await db.collection('passwordResetTokens').insertOne({ userId: user._id, tokenHash, expiresAt, usedAt: null, createdAt: now })
+  return { token, tokenHash, expiresAt, user: { id: user._id, email: user.email, firstName: user.firstName } }
+}
+
+export async function consumePasswordResetToken(db: Db, token: string, password: string) {
+  validatePassword(password)
+  if (!/^[A-Za-z0-9_-]{40,}$/.test(token)) return false
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
+  const passwordHash = await hashPassword(password)
+  const now = new Date()
+  const reset = await db.collection('passwordResetTokens').findOneAndUpdate(
+    { tokenHash, usedAt: null, expiresAt: { $gt: now } },
+    { $set: { usedAt: now } },
+    { returnDocument: 'after' },
+  )
+  if (!reset) return false
+  const updated = await db.collection<UserDocument>('users').updateOne({ _id: reset.userId, status: 'ACTIVE' }, { $set: { passwordHash, passwordUpdatedAt: now, updatedAt: now } })
+  if (!updated.modifiedCount) return false
+  await db.collection('passwordResetTokens').updateMany({ userId: reset.userId, usedAt: null }, { $set: { usedAt: now, invalidatedReason: 'password_reset' } })
+  await db.collection('auditLogs').insertOne({ userId: reset.userId, action: 'PASSWORD_RESET_COMPLETED', createdAt: now })
+  return true
 }
 
 export function signSession(user: SessionUser) {
@@ -96,7 +133,7 @@ function normalizePhone(value: string) {
 export async function registerOwner(db: Db, input: { firstName: string; lastName: string; email: string; password: string; businessName: string; industry: string; country: string; businessPhone: string }) {
   const email = input.email.trim().toLowerCase()
   if (!/^\S+@\S+\.\S+$/.test(email)) throw new Error('Enter a valid business email address.')
-  if (input.password.length < 12) throw new Error('Use a password with at least 12 characters.')
+  validatePassword(input.password)
   if (![input.firstName, input.lastName, input.businessName, input.industry, input.country, input.businessPhone].every(value => value.trim())) throw new Error('Complete every required registration field.')
   const businessPhone = normalizePhone(input.businessPhone)
   if (await db.collection<UserDocument>('users').findOne({ email })) throw new Error('An account already exists for that email address.')

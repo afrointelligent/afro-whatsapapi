@@ -101,6 +101,10 @@ export async function ensureWhatsappIndexes() {
     db.collection('whatsappConversations').createIndex({ tenantId: 1, customerPhone: 1 }, { unique: true }),
     db.collection('whatsappMessages').createIndex({ tenantId: 1, conversationId: 1, timestamp: -1 }),
     db.collection('whatsappMessages').createIndex({ tenantId: 1, metaMessageId: 1 }),
+    db.collection('passwordResetTokens').createIndex({ tokenHash: 1 }, { unique: true }),
+    db.collection('passwordResetTokens').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+    db.collection('passwordResetRateLimits').createIndex({ key: 1 }, { unique: true }),
+    db.collection('passwordResetRateLimits').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
     db.collection('verificationDocuments').createIndex({ tenantId: 1, uploadedAt: -1 }),
     ensureAuthIndexes(db),
   ])
