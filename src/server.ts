@@ -50,6 +50,14 @@ function encryptCredential(value: string) {
   return `${iv.toString('base64url')}.${cipher.getAuthTag().toString('base64url')}.${encrypted.toString('base64url')}`
 }
 
+function decryptCredential(value: string) {
+  const [ivPart, tagPart, encryptedPart] = value.split('.')
+  if (!ivPart || !tagPart || !encryptedPart) throw new Error('Stored connection credential is invalid')
+  const decipher = crypto.createDecipheriv('aes-256-gcm', credentialEncryptionKey(), Buffer.from(ivPart, 'base64url'))
+  decipher.setAuthTag(Buffer.from(tagPart, 'base64url'))
+  return Buffer.concat([decipher.update(Buffer.from(encryptedPart, 'base64url')), decipher.final()]).toString('utf8')
+}
+
 function credentialHint(value: string) {
   const clean = value.trim()
   return clean.length <= 4 ? 'Configured' : `Ends in ${clean.slice(-4)}`
@@ -415,13 +423,65 @@ app.get('/api/workspace/verification', async (req, res) => {
   const [tenant, documents, connection] = await Promise.all([
     db.collection('tenants').findOne({ _id: session.tenantId }, { projection: { legalBusinessName: 1, displayName: 1, tradingName: 1, industry: 1, workspaceSetup: 1, country: 1, registeredAddress: 1, businessEmail: 1, businessPhone: 1, website: 1, metaBusinessPortfolioId: 1, whatsappBusinessAccountId: 1, whatsappPhoneNumberId: 1, companyRegistrationNumber: 1, metaConnectionStatus: 1, verificationSubmissionStatus: 1, verificationSubmittedAt: 1 } }),
     db.collection('verificationDocuments').find({ tenantId: session.tenantId }).sort({ uploadedAt: -1 }).toArray(),
-    db.collection<WhatsAppConnection>('whatsappConnections').findOne({ tenantId: session.tenantId, status: 'CONNECTED' }),
+    db.collection<WhatsAppConnection>('whatsappConnections').findOne({ tenantId: session.tenantId, status: 'CONNECTED' }, { projection: { tenantId: 1, phoneNumberId: 1, wabaId: 1, businessId: 1, displayPhoneNumber: 1, verifiedName: 1, connectionType: 1, status: 1, onboardingStatus: 1 } }),
   ])
   const profile = (tenant || {}) as Record<string, any>
   const businessProfileComplete = Boolean(profile.legalBusinessName && profile.displayName && profile.industry && (profile.businessDescription || profile.workspaceSetup?.businessDescription))
-  const documentReadiness = profile.verificationSubmissionStatus === 'SUBMITTED_TO_META' ? 'SUBMITTED_TO_META' : profile.verificationSubmissionStatus === 'APPROVED_FOR_META_ONBOARDING' ? 'APPROVED_FOR_ONBOARDING' : profile.verificationSubmissionStatus === 'MORE_INFORMATION_REQUIRED' ? 'MORE_INFORMATION_NEEDED' : documents.length ? 'READY_FOR_REVIEW' : 'MORE_INFORMATION_NEEDED'
-  const readiness = { businessProfile: businessProfileComplete, businessEmail: Boolean(profile.businessEmail), businessWebsite: Boolean(profile.website), businessAddress: Boolean(profile.registeredAddress), phoneNumber: Boolean(profile.businessPhone), businessDocuments: documentReadiness, metaBusinessConnection: connection ? 'CONNECTED' : (profile.metaConnectionStatus || 'NOT_STARTED'), whatsappNumber: connection ? 'CONNECTED' : (profile.whatsappPhoneNumberId ? 'PENDING' : 'NOT_CONNECTED') }
-  res.json({ profile, documents: documents.map(document => ({ id: String(document._id), type: document.type, filename: document.filename, purpose: document.purpose, status: document.status, uploadedAt: document.uploadedAt })), readiness, canManage: canManageVerification(session) })
+  const documentReadiness = ['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(profile.verificationSubmissionStatus) ? 'APPROVED' : profile.verificationSubmissionStatus === 'MORE_INFORMATION_REQUIRED' ? 'MORE_INFORMATION_NEEDED' : profile.verificationSubmissionStatus === 'SUBMITTED_FOR_REVIEW' ? 'UNDER_AFROINTELLIGENT_REVIEW' : documents.length ? 'READY_FOR_AFROINTELLIGENT_REVIEW' : 'MORE_INFORMATION_NEEDED'
+  const readiness = { businessProfile: businessProfileComplete, businessEmail: Boolean(profile.businessEmail), businessWebsite: Boolean(profile.website), businessAddress: Boolean(profile.registeredAddress), phoneNumber: Boolean(profile.businessPhone), afroIntelligentReview: documentReadiness, metaBusinessConnection: connection ? 'CONNECTED' : 'NOT_CONNECTED', whatsappNumber: connection ? 'CONNECTED' : 'NOT_CONNECTED' }
+  res.json({ profile, documents: documents.map(document => ({ id: String(document._id), type: document.type, filename: document.filename, purpose: document.purpose, status: document.status, uploadedAt: document.uploadedAt })), readiness, connection: connection ? { connected: true, businessId: connection.businessId || null, wabaId: connection.wabaId || null, phoneNumberId: connection.phoneNumberId, displayPhoneNumber: connection.displayPhoneNumber || null, verifiedName: connection.verifiedName || null, onboardingStatus: connection.onboardingStatus || 'CONNECTED' } : { connected: false }, canConnectWhatsApp: ['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(profile.verificationSubmissionStatus) && !connection, canManage: canManageVerification(session) })
+})
+
+app.get('/api/workspace/whatsapp/embedded-signup-config', async (req, res) => {
+  const session = requireSession(req, res)
+  if (!session) return
+  const tenant = await (await getDb()).collection('tenants').findOne({ _id: session.tenantId }, { projection: { verificationSubmissionStatus: 1 } })
+  if (!['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(String(tenant?.verificationSubmissionStatus))) return res.status(403).json({ error: 'AfroIntelligent onboarding approval is required before connecting WhatsApp Business.' })
+  const appId = process.env.META_APP_ID
+  const configId = process.env.META_EMBEDDED_SIGNUP_CONFIG_ID
+  if (!appId || !configId || !process.env.META_APP_SECRET) return res.status(503).json({ error: 'WhatsApp Business connection setup is not available yet.' })
+  res.json({ appId, configId, apiVersion })
+})
+
+app.post('/api/workspace/whatsapp/embedded-signup/complete', async (req, res) => {
+  const session = requireSession(req, res)
+  if (!session) return
+  if (!canManageVerification(session)) return res.status(403).json({ error: 'Only workspace owners and administrators can connect WhatsApp Business.' })
+  const code = String(req.body?.code || '')
+  const wabaId = String(req.body?.wabaId || '')
+  const phoneNumberId = String(req.body?.phoneNumberId || '')
+  const businessId = String(req.body?.businessId || '')
+  if (!code || !/^\d+$/.test(wabaId) || !/^\d+$/.test(phoneNumberId) || (businessId && !/^\d+$/.test(businessId))) return res.status(400).json({ error: 'Meta did not return a complete WhatsApp Business connection.' })
+  const db = await getDb()
+  const tenant = await db.collection('tenants').findOne({ _id: session.tenantId }, { projection: { verificationSubmissionStatus: 1 } })
+  if (!['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(String(tenant?.verificationSubmissionStatus))) return res.status(403).json({ error: 'AfroIntelligent onboarding approval is required before connecting WhatsApp Business.' })
+  const appId = process.env.META_APP_ID
+  const appSecret = process.env.META_APP_SECRET
+  if (!appId || !appSecret) return res.status(503).json({ error: 'Meta connection credentials are not configured.' })
+  try {
+    const tokenResponse = await fetch(`https://graph.facebook.com/${apiVersion}/oauth/access_token`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: appId, client_secret: appSecret, code }) })
+    const tokenResult = await tokenResponse.json() as { access_token?: string; error?: { message?: string } }
+    if (!tokenResponse.ok || !tokenResult.access_token) throw new Error(tokenResult.error?.message || 'Meta authorization-code exchange failed.')
+    const headers = { Authorization: `Bearer ${tokenResult.access_token}` }
+    const phonesResponse = await fetch(`https://graph.facebook.com/${apiVersion}/${wabaId}/phone_numbers?fields=id,display_phone_number,verified_name`, { headers })
+    const phones = await phonesResponse.json() as { data?: Array<{ id: string; display_phone_number?: string; verified_name?: string }>; error?: { message?: string } }
+    if (!phonesResponse.ok) throw new Error(phones.error?.message || 'Meta could not verify the selected WhatsApp number.')
+    const selectedPhone = phones.data?.find(phone => phone.id === phoneNumberId)
+    if (!selectedPhone) throw new Error('The selected phone number does not belong to the authorized WhatsApp Business Account.')
+    const subscribeResponse = await fetch(`https://graph.facebook.com/${apiVersion}/${wabaId}/subscribed_apps`, { method: 'POST', headers })
+    const subscribed = await subscribeResponse.json() as { success?: boolean; error?: { message?: string } }
+    if (!subscribeResponse.ok || subscribed.success !== true) throw new Error(subscribed.error?.message || 'AfroIntelligent could not subscribe to WhatsApp events.')
+    const existingConnection = await db.collection<WhatsAppConnection>('whatsappConnections').findOne({ phoneNumberId })
+    if (existingConnection && !existingConnection.tenantId.equals(session.tenantId)) throw new Error('This WhatsApp number is already connected to another AfroIntelligent workspace.')
+    const now = new Date()
+    await db.collection<WhatsAppConnection>('whatsappConnections').updateOne({ phoneNumberId }, { $set: { tenantId: session.tenantId, businessId, wabaId, phoneNumberId, displayPhoneNumber: selectedPhone.display_phone_number || '', verifiedName: selectedPhone.verified_name || '', accessTokenEncrypted: encryptCredential(tokenResult.access_token), connectionType: 'CUSTOMER_OWNED', status: 'CONNECTED', onboardingStatus: 'CONNECTED', updatedAt: now }, $setOnInsert: { createdAt: now } }, { upsert: true })
+    await db.collection('tenants').updateOne({ _id: session.tenantId }, { $set: { metaBusinessPortfolioId: businessId, whatsappBusinessAccountId: wabaId, whatsappPhoneNumberId: phoneNumberId, displayPhoneNumber: selectedPhone.display_phone_number || '', metaConnectionStatus: 'CONNECTED', whatsappOnboardingStatus: 'CONNECTED', updatedAt: now } })
+    await db.collection('auditLogs').insertOne({ tenantId: session.tenantId, userId: session.userId, action: 'WHATSAPP_EMBEDDED_SIGNUP_COMPLETED', createdAt: now, metadata: { businessId, wabaId, phoneNumberId } })
+    res.json({ ok: true, connection: { businessId: businessId || null, wabaId, phoneNumberId, displayPhoneNumber: selectedPhone.display_phone_number || null, verifiedName: selectedPhone.verified_name || null } })
+  } catch (error) {
+    console.error('WhatsApp Embedded Signup completion failed:', error instanceof Error ? error.message : 'unknown error')
+    res.status(502).json({ error: error instanceof Error ? error.message : 'WhatsApp Business could not be connected.' })
+  }
 })
 
 app.post('/api/workspace/verification/submit', async (req, res) => {
@@ -444,7 +504,7 @@ app.put('/api/workspace/verification/profile', async (req, res) => {
   if (!session) return
   if (!canManageVerification(session)) return res.status(403).json({ error: 'Only workspace owners and administrators can update verification information.' })
   const body = req.body || {}
-  const fields = ['legalBusinessName', 'displayName', 'tradingName', 'industry', 'businessDescription', 'country', 'registeredAddress', 'businessEmail', 'businessPhone', 'website', 'metaBusinessPortfolioId', 'whatsappBusinessAccountId', 'whatsappPhoneNumberId', 'companyRegistrationNumber'] as const
+  const fields = ['legalBusinessName', 'displayName', 'tradingName', 'industry', 'businessDescription', 'country', 'registeredAddress', 'businessEmail', 'businessPhone', 'website', 'companyRegistrationNumber'] as const
   const update: Record<string, string | Date> = { updatedAt: new Date() }
   for (const field of fields) update[field] = String(body[field] || '').trim().slice(0, 1000)
   if (update.businessEmail && !/^\S+@\S+\.\S+$/.test(String(update.businessEmail))) return res.status(400).json({ error: 'Enter a valid business email address.' })
@@ -504,7 +564,7 @@ app.get('/api/admin/verification-documents', async (req, res) => {
     { $lookup: { from: 'tenants', localField: 'tenantId', foreignField: '_id', as: 'tenant' } }, { $unwind: '$tenant' },
     { $project: { filename: 1, type: 1, purpose: 1, status: 1, uploadedAt: 1, tenantId: 1, tenantName: '$tenant.name', tenantEmail: '$tenant.businessEmail', tenantVerificationStatus: '$tenant.verificationSubmissionStatus' } },
   ]).toArray()
-  const summary = { total: documents.length, ready: documents.filter(document => document.tenantVerificationStatus === 'APPROVED_FOR_META_ONBOARDING').length, replacementRequired: documents.filter(document => document.status === 'REPLACEMENT_REQUIRED').length, submittedExternally: documents.filter(document => document.tenantVerificationStatus === 'SUBMITTED_TO_META').length, businesses: new Set(documents.map(document => String(document.tenantId))).size }
+  const summary = { total: documents.length, approved: documents.filter(document => ['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(document.tenantVerificationStatus)).length, replacementRequired: documents.filter(document => document.status === 'REPLACEMENT_REQUIRED').length, underReview: documents.filter(document => document.tenantVerificationStatus === 'SUBMITTED_FOR_REVIEW').length, businesses: new Set(documents.map(document => String(document.tenantId))).size }
   res.json({ summary, documents: documents.map(document => ({ id: String(document._id), tenantId: String(document.tenantId), tenantName: document.tenantName, tenantEmail: document.tenantEmail, tenantVerificationStatus: document.tenantVerificationStatus, filename: document.filename, type: document.type, purpose: document.purpose, status: document.status, uploadedAt: document.uploadedAt })) })
 })
 
@@ -512,12 +572,11 @@ app.patch('/api/admin/verification-documents/:documentId', async (req, res) => {
   const admin = await requirePlatformAdmin(req, res)
   if (!admin) return
   const status = String(req.body?.status || '')
-  const allowed = ['READY_FOR_VERIFICATION', 'SUBMITTED_EXTERNALLY', 'REJECTED', 'REPLACEMENT_REQUIRED']
+  const allowed = ['READY_FOR_VERIFICATION', 'REJECTED', 'REPLACEMENT_REQUIRED']
   if (!ObjectId.isValid(req.params.documentId) || !allowed.includes(status)) return res.status(400).json({ error: 'Choose a valid review status.' })
   const db = await getDb(); const document = await db.collection('verificationDocuments').findOneAndUpdate({ _id: new ObjectId(req.params.documentId) }, { $set: { status, reviewedBy: admin.userId, reviewedAt: new Date(), updatedAt: new Date() } }, { returnDocument: 'after' })
   if (!document) return res.status(404).json({ error: 'Document not found.' })
   if (status === 'READY_FOR_VERIFICATION') await db.collection('tenants').updateOne({ _id: document.tenantId }, { $set: { verificationSubmissionStatus: 'APPROVED_FOR_META_ONBOARDING', verificationApprovedAt: new Date(), updatedAt: new Date() } })
-  if (status === 'SUBMITTED_EXTERNALLY') await db.collection('tenants').updateOne({ _id: document.tenantId }, { $set: { verificationSubmissionStatus: 'SUBMITTED_TO_META', verificationSubmittedToMetaAt: new Date(), updatedAt: new Date() } })
   if (status === 'REPLACEMENT_REQUIRED' || status === 'REJECTED') await db.collection('tenants').updateOne({ _id: document.tenantId }, { $set: { verificationSubmissionStatus: 'MORE_INFORMATION_REQUIRED', updatedAt: new Date() } })
   await db.collection('auditLogs').insertOne({ tenantId: document.tenantId, userId: admin.userId, action: 'VERIFICATION_DOCUMENT_REVIEWED', createdAt: new Date(), metadata: { documentId: String(document._id), status } })
   res.json({ ok: true, status })
@@ -628,8 +687,8 @@ function validSignature(req: Request) {
   return actual.length === wanted.length && crypto.timingSafeEqual(actual, wanted)
 }
 
-export async function sendWhatsAppTextMessage(to: string, message: string, connection?: Pick<WhatsAppConnection, 'accessToken' | 'phoneNumberId'>) {
-  const token = connection?.accessToken || process.env.WHATSAPP_ACCESS_TOKEN
+export async function sendWhatsAppTextMessage(to: string, message: string, connection?: Pick<WhatsAppConnection, 'accessToken' | 'accessTokenEncrypted' | 'phoneNumberId'>) {
+  const token = connection?.accessTokenEncrypted ? decryptCredential(connection.accessTokenEncrypted) : connection?.accessToken || process.env.WHATSAPP_ACCESS_TOKEN
   const phoneNumberId = connection?.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID
   if (!token || !phoneNumberId) throw new Error('WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID are required')
   const response = await fetch(`https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: to.replace(/\D/g, ''), type: 'text', text: { body: message } }) })

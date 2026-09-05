@@ -19,6 +19,6 @@ The verify token is a private value created for webhook verification. It is not 
 
 ## Environment
 
-Configure these server-side values in Render: `PRODUCT_BASE_URL`, `API_BASE_URL`, `FRONTEND_URL`, `PUBLIC_API_URL`, `SESSION_SECRET`, `CREDENTIAL_ENCRYPTION_KEY`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_BUSINESS_ACCOUNT_ID`, `META_APP_ID`, `META_APP_SECRET`, `META_API_VERSION`, `MONGODB_URI`, `MONGO_DB_NAME`, and `INTERNAL_API_KEY` as applicable. Do not expose secrets in browser variables.
+Configure these server-side values in Render: `PRODUCT_BASE_URL`, `API_BASE_URL`, `FRONTEND_URL`, `PUBLIC_API_URL`, `SESSION_SECRET`, `CREDENTIAL_ENCRYPTION_KEY`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_BUSINESS_ACCOUNT_ID`, `META_APP_ID`, `META_APP_SECRET`, `META_EMBEDDED_SIGNUP_CONFIG_ID`, `META_API_VERSION`, `MONGODB_URI`, `MONGO_DB_NAME`, and `INTERNAL_API_KEY` as applicable. Do not expose secrets in browser variables. `META_APP_ID` and `META_EMBEDDED_SIGNUP_CONFIG_ID` are public identifiers returned only to an approved, authenticated workspace; the app secret and connection access token remain server-side.
 
 Localhost remains supported for development. Do not place localhost, ngrok, Render-generated or Vercel URLs into production Meta settings.

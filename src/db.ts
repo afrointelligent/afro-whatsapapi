@@ -26,6 +26,11 @@ export type WhatsAppConnection = {
   /** Tenant token is required for customer-owned live connections. The review
    * test number deliberately uses the Render-only fallback token. */
   accessToken?: string
+  accessTokenEncrypted?: string
+  businessId?: string
+  displayPhoneNumber?: string
+  verifiedName?: string
+  onboardingStatus?: 'CONNECTED' | 'ERROR'
   connectionType?: 'META_TEST_NUMBER' | 'CUSTOMER_OWNED'
   status: 'CONNECTED' | 'DISCONNECTED' | 'ERROR'
   createdAt: Date
