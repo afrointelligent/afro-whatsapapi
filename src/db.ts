@@ -7,7 +7,7 @@ function mongoUri() {
   return process.env.MONGODB_URI || process.env.MONGO_URL || process.env.DATABASE_URL || ''
 }
 
-export async function getDb(): Promise<Db> {
+export async function getMongoClient(): Promise<MongoClient> {
   const uri = mongoUri()
   if (!uri) throw new Error('MONGODB_URI is required for durable WhatsApp processing')
   if (!clientPromise) {
@@ -16,7 +16,11 @@ export async function getDb(): Promise<Db> {
       throw error
     })
   }
-  return (await clientPromise).db(process.env.MONGO_DB_NAME || 'afrointelligent')
+  return clientPromise
+}
+
+export async function getDb(): Promise<Db> {
+  return (await getMongoClient()).db(process.env.MONGO_DB_NAME || 'afrointelligent')
 }
 
 export type WhatsAppConnection = {

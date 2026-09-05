@@ -5,10 +5,10 @@ import express, { type Request, type Response } from 'express'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createProxyMiddleware } from 'http-proxy-middleware'
-import { GridFSBucket, ObjectId } from 'mongodb'
+import { GridFSBucket, ObjectId, type ClientSession } from 'mongodb'
 import multer from 'multer'
 import nodemailer from 'nodemailer'
-import { ensureWhatsappIndexes, getConnectionForPhoneId, getDb, recordMessageStatus, recordOutboundMessage, recordWebhookMessage, type WhatsAppConnection } from './db.js'
+import { ensureWhatsappIndexes, getConnectionForPhoneId, getDb, getMongoClient, recordMessageStatus, recordOutboundMessage, recordWebhookMessage, type WhatsAppConnection } from './db.js'
 import { consumePasswordResetToken, createPasswordResetToken, expiredSessionCookie, loginUser, readCookie, readSession, registerOwner, sessionCookie, signSession, verifyPassword } from './auth.js'
 
 type AutomationMode = 'AI_ACTIVE' | 'HUMAN_ACTIVE'
@@ -416,6 +416,64 @@ const verificationStatuses = ['UPLOADED', 'READY_FOR_VERIFICATION', 'SUBMITTED_E
 const verificationDocumentTypes = ['COMPANY_REGISTRATION', 'INCORPORATION_CERTIFICATE', 'BUSINESS_LICENCE', 'BANK_STATEMENT', 'UTILITY_BILL', 'META_SUPPORTING_DOCUMENT'] as const
 function canManageVerification(session: ReturnType<typeof requireSession>) { return session?.role === 'OWNER' || session?.role === 'ADMIN' }
 
+function transactionUnavailable(error: unknown) {
+  const code = typeof error === 'object' && error && 'code' in error ? Number(error.code) : 0
+  const message = error instanceof Error ? error.message : ''
+  return [20, 263].includes(code) || /Transaction numbers are only allowed|does not support transactions|replica set member or mongos/i.test(message)
+}
+
+type EmbeddedConnectionInput = { businessId: string; wabaId: string; phoneNumberId: string; displayPhoneNumber: string; verifiedName: string; encryptedToken: string }
+
+async function writeEmbeddedConnection(db: Awaited<ReturnType<typeof getDb>>, tenantId: ObjectId, userId: ObjectId, input: EmbeddedConnectionInput, session?: ClientSession) {
+  const options = session ? { session } : undefined
+  const occupied = await db.collection<WhatsAppConnection>('whatsappConnections').findOne({ phoneNumberId: input.phoneNumberId }, options)
+  if (occupied && !occupied.tenantId.equals(tenantId)) throw new Error('This WhatsApp number is already connected to another AfroIntelligent workspace.')
+  const now = new Date()
+  await db.collection('tenants').updateOne({ _id: tenantId }, { $set: { metaBusinessPortfolioId: input.businessId, whatsappBusinessAccountId: input.wabaId, whatsappPhoneNumberId: input.phoneNumberId, displayPhoneNumber: input.displayPhoneNumber, metaConnectionStatus: 'CONNECTED', whatsappOnboardingStatus: 'CONNECTED', updatedAt: now } }, options)
+  await db.collection('auditLogs').insertOne({ tenantId, userId, action: 'WHATSAPP_EMBEDDED_SIGNUP_COMPLETED', createdAt: now, metadata: { businessId: input.businessId, wabaId: input.wabaId, phoneNumberId: input.phoneNumberId } }, options)
+  await db.collection<WhatsAppConnection>('whatsappConnections').updateOne({ phoneNumberId: input.phoneNumberId, tenantId }, { $set: { tenantId, businessId: input.businessId, wabaId: input.wabaId, phoneNumberId: input.phoneNumberId, displayPhoneNumber: input.displayPhoneNumber, verifiedName: input.verifiedName, accessTokenEncrypted: input.encryptedToken, connectionType: 'CUSTOMER_OWNED', status: 'CONNECTED', onboardingStatus: 'CONNECTED', updatedAt: now }, $unset: { accessToken: '' }, $setOnInsert: { createdAt: now } }, { ...options, upsert: true })
+}
+
+async function persistEmbeddedConnection(tenantId: ObjectId, userId: ObjectId, input: EmbeddedConnectionInput) {
+  const client = await getMongoClient()
+  const db = client.db(process.env.MONGO_DB_NAME || 'afrointelligent')
+  const mongoSession = client.startSession()
+  try {
+    await mongoSession.withTransaction(() => writeEmbeddedConnection(db, tenantId, userId, input, mongoSession))
+    return
+  } catch (error) {
+    if (!transactionUnavailable(error)) throw error
+  } finally {
+    await mongoSession.endSession()
+  }
+
+  const tenantFields = ['metaBusinessPortfolioId', 'whatsappBusinessAccountId', 'whatsappPhoneNumberId', 'displayPhoneNumber', 'metaConnectionStatus', 'whatsappOnboardingStatus'] as const
+  const [previousConnection, previousTenant] = await Promise.all([
+    db.collection<WhatsAppConnection>('whatsappConnections').findOne({ phoneNumberId: input.phoneNumberId }),
+    db.collection('tenants').findOne({ _id: tenantId }, { projection: Object.fromEntries(tenantFields.map(field => [field, 1])) }),
+  ])
+  try {
+    await writeEmbeddedConnection(db, tenantId, userId, input)
+  } catch (error) {
+    try {
+      if (previousConnection) await db.collection<WhatsAppConnection>('whatsappConnections').replaceOne({ _id: previousConnection._id }, previousConnection)
+      else await db.collection('whatsappConnections').deleteOne({ tenantId, phoneNumberId: input.phoneNumberId })
+      const restoreSet: Record<string, unknown> = {}
+      const restoreUnset: Record<string, ''> = {}
+      for (const field of tenantFields) {
+        if (previousTenant && field in previousTenant) restoreSet[field] = previousTenant[field]
+        else restoreUnset[field] = ''
+      }
+      await db.collection('tenants').updateOne({ _id: tenantId }, { ...(Object.keys(restoreSet).length ? { $set: restoreSet } : {}), ...(Object.keys(restoreUnset).length ? { $unset: restoreUnset } : {}) })
+      await db.collection('auditLogs').deleteMany({ tenantId, action: 'WHATSAPP_EMBEDDED_SIGNUP_COMPLETED', 'metadata.phoneNumberId': input.phoneNumberId, createdAt: { $gte: new Date(Date.now() - 60_000) } })
+    } catch (rollbackError) {
+      await db.collection('whatsappConnections').updateMany({ tenantId, phoneNumberId: input.phoneNumberId }, { $set: { status: 'ERROR', onboardingStatus: 'ERROR', updatedAt: new Date() } }).catch(() => undefined)
+      console.error('Critical Embedded Signup rollback failure:', rollbackError instanceof Error ? rollbackError.message : 'unknown error')
+    }
+    throw error
+  }
+}
+
 app.get('/api/workspace/verification', async (req, res) => {
   const session = requireSession(req, res)
   if (!session) return
@@ -471,12 +529,7 @@ app.post('/api/workspace/whatsapp/embedded-signup/complete', async (req, res) =>
     const subscribeResponse = await fetch(`https://graph.facebook.com/${apiVersion}/${wabaId}/subscribed_apps`, { method: 'POST', headers })
     const subscribed = await subscribeResponse.json() as { success?: boolean; error?: { message?: string } }
     if (!subscribeResponse.ok || subscribed.success !== true) throw new Error(subscribed.error?.message || 'AfroIntelligent could not subscribe to WhatsApp events.')
-    const existingConnection = await db.collection<WhatsAppConnection>('whatsappConnections').findOne({ phoneNumberId })
-    if (existingConnection && !existingConnection.tenantId.equals(session.tenantId)) throw new Error('This WhatsApp number is already connected to another AfroIntelligent workspace.')
-    const now = new Date()
-    await db.collection<WhatsAppConnection>('whatsappConnections').updateOne({ phoneNumberId }, { $set: { tenantId: session.tenantId, businessId, wabaId, phoneNumberId, displayPhoneNumber: selectedPhone.display_phone_number || '', verifiedName: selectedPhone.verified_name || '', accessTokenEncrypted: encryptCredential(tokenResult.access_token), connectionType: 'CUSTOMER_OWNED', status: 'CONNECTED', onboardingStatus: 'CONNECTED', updatedAt: now }, $setOnInsert: { createdAt: now } }, { upsert: true })
-    await db.collection('tenants').updateOne({ _id: session.tenantId }, { $set: { metaBusinessPortfolioId: businessId, whatsappBusinessAccountId: wabaId, whatsappPhoneNumberId: phoneNumberId, displayPhoneNumber: selectedPhone.display_phone_number || '', metaConnectionStatus: 'CONNECTED', whatsappOnboardingStatus: 'CONNECTED', updatedAt: now } })
-    await db.collection('auditLogs').insertOne({ tenantId: session.tenantId, userId: session.userId, action: 'WHATSAPP_EMBEDDED_SIGNUP_COMPLETED', createdAt: now, metadata: { businessId, wabaId, phoneNumberId } })
+    await persistEmbeddedConnection(session.tenantId, session.userId, { businessId, wabaId, phoneNumberId, displayPhoneNumber: selectedPhone.display_phone_number || '', verifiedName: selectedPhone.verified_name || '', encryptedToken: encryptCredential(tokenResult.access_token) })
     res.json({ ok: true, connection: { businessId: businessId || null, wabaId, phoneNumberId, displayPhoneNumber: selectedPhone.display_phone_number || null, verifiedName: selectedPhone.verified_name || null } })
   } catch (error) {
     console.error('WhatsApp Embedded Signup completion failed:', error instanceof Error ? error.message : 'unknown error')
@@ -562,10 +615,18 @@ app.get('/api/admin/verification-documents', async (req, res) => {
   const documents = await db.collection('verificationDocuments').aggregate([
     { $sort: { uploadedAt: -1 } }, { $limit: 300 },
     { $lookup: { from: 'tenants', localField: 'tenantId', foreignField: '_id', as: 'tenant' } }, { $unwind: '$tenant' },
-    { $project: { filename: 1, type: 1, purpose: 1, status: 1, uploadedAt: 1, tenantId: 1, tenantName: '$tenant.name', tenantEmail: '$tenant.businessEmail', tenantVerificationStatus: '$tenant.verificationSubmissionStatus' } },
+    { $lookup: { from: 'whatsappConnections', let: { tenantId: '$tenantId' }, pipeline: [{ $match: { $expr: { $and: [{ $eq: ['$tenantId', '$$tenantId'] }, { $eq: ['$status', 'CONNECTED'] }] } } }, { $project: { wabaId: 1, displayPhoneNumber: 1, status: 1 } }, { $limit: 1 }], as: 'connection' } },
+    { $unwind: { path: '$connection', preserveNullAndEmptyArrays: true } },
+    { $project: { filename: 1, type: 1, purpose: 1, status: 1, uploadedAt: 1, tenantId: 1, tenantName: '$tenant.name', tenantEmail: '$tenant.businessEmail', tenantVerificationStatus: '$tenant.verificationSubmissionStatus', legalBusinessName: '$tenant.legalBusinessName', displayName: '$tenant.displayName', industry: '$tenant.industry', businessPhone: '$tenant.businessPhone', website: '$tenant.website', registeredAddress: '$tenant.registeredAddress', metaConnectionStatus: { $ifNull: ['$connection.status', 'NOT_CONNECTED'] }, wabaConnected: { $cond: [{ $ifNull: ['$connection.wabaId', false] }, true, false] }, displayPhoneNumber: { $ifNull: ['$connection.displayPhoneNumber', null] } } },
   ]).toArray()
-  const summary = { total: documents.length, approved: documents.filter(document => ['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(document.tenantVerificationStatus)).length, replacementRequired: documents.filter(document => document.status === 'REPLACEMENT_REQUIRED').length, underReview: documents.filter(document => document.tenantVerificationStatus === 'SUBMITTED_FOR_REVIEW').length, businesses: new Set(documents.map(document => String(document.tenantId))).size }
-  res.json({ summary, documents: documents.map(document => ({ id: String(document._id), tenantId: String(document.tenantId), tenantName: document.tenantName, tenantEmail: document.tenantEmail, tenantVerificationStatus: document.tenantVerificationStatus, filename: document.filename, type: document.type, purpose: document.purpose, status: document.status, uploadedAt: document.uploadedAt })) })
+  const summary = {
+    total: documents.length,
+    approved: new Set(documents.filter(document => ['APPROVED_FOR_META_ONBOARDING', 'SUBMITTED_TO_META'].includes(document.tenantVerificationStatus)).map(document => String(document.tenantId))).size,
+    replacementRequired: documents.filter(document => document.status === 'REPLACEMENT_REQUIRED').length,
+    underReview: new Set(documents.filter(document => document.tenantVerificationStatus === 'SUBMITTED_FOR_REVIEW').map(document => String(document.tenantId))).size,
+    businesses: new Set(documents.map(document => String(document.tenantId))).size
+  }
+  res.json({ summary, documents: documents.map(document => ({ id: String(document._id), tenantId: String(document.tenantId), tenantName: document.tenantName, tenantEmail: document.tenantEmail, tenantVerificationStatus: document.tenantVerificationStatus, profile: { legalBusinessName: document.legalBusinessName || null, displayName: document.displayName || null, industry: document.industry || null, businessEmail: document.tenantEmail || null, businessPhone: document.businessPhone || null, website: document.website || null, registeredAddress: document.registeredAddress || null }, connection: { status: document.metaConnectionStatus, wabaConnected: Boolean(document.wabaConnected), displayPhoneNumber: document.displayPhoneNumber || null }, filename: document.filename, type: document.type, purpose: document.purpose, status: document.status, uploadedAt: document.uploadedAt })) })
 })
 
 app.patch('/api/admin/verification-documents/:documentId', async (req, res) => {
@@ -576,10 +637,24 @@ app.patch('/api/admin/verification-documents/:documentId', async (req, res) => {
   if (!ObjectId.isValid(req.params.documentId) || !allowed.includes(status)) return res.status(400).json({ error: 'Choose a valid review status.' })
   const db = await getDb(); const document = await db.collection('verificationDocuments').findOneAndUpdate({ _id: new ObjectId(req.params.documentId) }, { $set: { status, reviewedBy: admin.userId, reviewedAt: new Date(), updatedAt: new Date() } }, { returnDocument: 'after' })
   if (!document) return res.status(404).json({ error: 'Document not found.' })
-  if (status === 'READY_FOR_VERIFICATION') await db.collection('tenants').updateOne({ _id: document.tenantId }, { $set: { verificationSubmissionStatus: 'APPROVED_FOR_META_ONBOARDING', verificationApprovedAt: new Date(), updatedAt: new Date() } })
-  if (status === 'REPLACEMENT_REQUIRED' || status === 'REJECTED') await db.collection('tenants').updateOne({ _id: document.tenantId }, { $set: { verificationSubmissionStatus: 'MORE_INFORMATION_REQUIRED', updatedAt: new Date() } })
   await db.collection('auditLogs').insertOne({ tenantId: document.tenantId, userId: admin.userId, action: 'VERIFICATION_DOCUMENT_REVIEWED', createdAt: new Date(), metadata: { documentId: String(document._id), status } })
   res.json({ ok: true, status })
+})
+
+app.patch('/api/admin/onboarding/:tenantId', async (req, res) => {
+  const admin = await requirePlatformAdmin(req, res)
+  if (!admin) return
+  if (!ObjectId.isValid(req.params.tenantId)) return res.status(400).json({ error: 'Invalid workspace.' })
+  const decision = String(req.body?.decision || '')
+  const statuses: Record<string, string> = { APPROVE: 'APPROVED_FOR_META_ONBOARDING', MORE_INFORMATION: 'MORE_INFORMATION_REQUIRED', REJECT: 'AFROINTELLIGENT_REJECTED' }
+  if (!statuses[decision]) return res.status(400).json({ error: 'Choose a valid onboarding decision.' })
+  const db = await getDb()
+  const tenantId = new ObjectId(req.params.tenantId)
+  const now = new Date()
+  const result = await db.collection('tenants').updateOne({ _id: tenantId }, { $set: { verificationSubmissionStatus: statuses[decision], onboardingDecisionAt: now, onboardingDecisionBy: admin.userId, updatedAt: now } })
+  if (!result.matchedCount) return res.status(404).json({ error: 'Workspace not found.' })
+  await db.collection('auditLogs').insertOne({ tenantId, userId: admin.userId, action: 'AFROINTELLIGENT_ONBOARDING_DECISION', createdAt: now, metadata: { decision, status: statuses[decision] } })
+  res.json({ ok: true, status: statuses[decision] })
 })
 
 app.get('/api/admin/verification-documents/:documentId/download', async (req, res) => {
@@ -796,6 +871,8 @@ app.get('/readiness', (_req, res) => {
     mongoConfigured: Boolean(process.env.MONGODB_URI || process.env.MONGO_URL || process.env.DATABASE_URL),
     webhookVerifyTokenConfigured: Boolean(process.env.WHATSAPP_VERIFY_TOKEN),
     webhookSignatureConfigured: Boolean(process.env.META_APP_SECRET),
+    embeddedSignupConfigured: Boolean(process.env.META_APP_ID && process.env.META_APP_SECRET && process.env.META_EMBEDDED_SIGNUP_CONFIG_ID),
+    credentialEncryptionKeyConfigured: Boolean(process.env.CREDENTIAL_ENCRYPTION_KEY && process.env.CREDENTIAL_ENCRYPTION_KEY.length >= 32),
     testPhoneConfigured: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_ACCESS_TOKEN),
     internalApiProtected: Boolean(process.env.INTERNAL_API_KEY),
   }

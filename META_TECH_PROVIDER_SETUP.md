@@ -6,6 +6,8 @@ Configure the Meta App Domain as `automate.afrointelligent.co.za`. Configure the
 
 Embedded Signup must follow Meta's current official flow. Do not promise number eligibility before Meta checks it. Store resulting business portfolio, WABA and phone-number identifiers tenant-by-tenant. Tokens and app secrets must remain server-side and encrypted where stored.
 
+Configure `META_APP_ID`, `META_APP_SECRET`, and `META_EMBEDDED_SIGNUP_CONFIG_ID` in the production service. Configure `CREDENTIAL_ENCRYPTION_KEY` as an independent random secret of at least 32 characters. Do not reuse or expose the key, place it in client-side code, commit it, or include it in review recordings. Rotating this key requires a deliberate credential re-encryption plan because existing customer connection tokens depend on it.
+
 Required public policies:
 
 - `https://automate.afrointelligent.co.za/privacy`

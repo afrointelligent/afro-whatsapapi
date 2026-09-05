@@ -6,9 +6,8 @@ Request only permissions needed by implemented reviewer-visible functionality.
 | --- | --- | --- |
 | Send and receive WhatsApp messages | `whatsapp_business_messaging` | Cloud API messages, signed webhook inbox, dashboard replies |
 | Manage WhatsApp business assets used by onboarding | `whatsapp_business_management` | Embedded Signup authorization, authorized WABA phone-number discovery and app subscription |
-| Access business assets during Tech Provider onboarding | `business_management` | Only where required by the current official Embedded Signup flow |
 
-Exact permission requirements can change. Confirm them in Meta's current official WhatsApp Business Platform and Embedded Signup documentation before submission. Do not request broader access merely for future features.
+The current Advanced Access request is limited to `whatsapp_business_management`. Do not request Facebook, Instagram, Ads, template, or other permissions for functionality that is not implemented. Confirm Meta's current official Embedded Signup requirements before changing the requested scope.
 
 Production URLs:
 
