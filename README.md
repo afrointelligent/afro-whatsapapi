@@ -24,3 +24,7 @@ Client onboarding starts with a basic business profile. Supporting documents are
 Production Embedded Signup requires `META_APP_ID`, `META_APP_SECRET`, `META_EMBEDDED_SIGNUP_CONFIG_ID`, and an independent 32+ character `CREDENTIAL_ENCRYPTION_KEY`. `/readiness` reports only whether these values are configured; it never returns their values.
 
 See the `META_*.md` files for the production configuration, management-permission walkthrough, and review checklists.
+
+## Inbound foundation and Meta configuration gate
+
+See [WHATSAPP_WEBHOOK_HANDOFF.md](WHATSAPP_WEBHOOK_HANDOFF.md) for the deployment prerequisites, Render environment, secure API/realtime contract and test instructions. The real-message test and Super Admin changes remain gated on manual Meta webhook configuration.

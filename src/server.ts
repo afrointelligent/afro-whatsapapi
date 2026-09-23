@@ -1,5 +1,8 @@
 import 'dotenv/config'
 import crypto from 'node:crypto'
+import { createServer } from 'node:http'
+import { webhookRouter, whatsappApi, attachWhatsAppRealtime } from './whatsapp.js'
+import { provisionInternalTenant } from './whatsapp-store.js'
 import cors from 'cors'
 import express, { type Request, type Response } from 'express'
 import path from 'node:path'
@@ -8,7 +11,7 @@ import { createProxyMiddleware } from 'http-proxy-middleware'
 import { GridFSBucket, ObjectId, type ClientSession } from 'mongodb'
 import multer from 'multer'
 import nodemailer from 'nodemailer'
-import { ensureWhatsappIndexes, getConnectionForPhoneId, getDb, getMongoClient, recordMessageStatus, recordOutboundMessage, recordWebhookMessage, type WhatsAppConnection } from './db.js'
+import { ensureWhatsappIndexes, closeMongoClient, getConnectionForPhoneId, getDb, getMongoClient, recordOutboundMessage, type WhatsAppConnection } from './db.js'
 import { consumePasswordResetToken, createPasswordResetToken, expiredSessionCookie, loginUser, readCookie, readSession, registerOwner, sessionCookie, signSession, verifyPassword } from './auth.js'
 import { canLaunchEmbeddedSignup, hasConnectableBusinessProfile } from './onboarding.js'
 
@@ -19,13 +22,12 @@ type Activity = { id: string; at: string; title: string; detail: string; tone: '
 
 const port = Number(process.env.PORT ?? 3001)
 const projectDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const apiVersion = process.env.META_API_VERSION ?? 'v22.0'
-const serviceRelease = 'canonical-domain-2026-08-15.1'
+const apiVersion = process.env.META_API_VERSION ?? 'v25.0'
+const serviceRelease = 'whatsapp-foundation-2026-09-22.1'
 const canonicalProductionOrigin = 'https://automate.afrointelligent.co.za'
-const app = express()
+export const app = express()
 const verificationUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 }, fileFilter: (_req, file, callback) => callback(null, ['application/pdf', 'image/jpeg', 'image/png'].includes(file.mimetype)) })
 const conversations = new Map<string, Conversation>()
-const processedMessageIds = new Set<string>()
 const activities: Activity[] = []
 
 function addActivity(title: string, detail: string, tone: Activity['tone'] = 'info') {
@@ -224,6 +226,7 @@ app.get('/api/auth/me', async (req, res) => {
 
 app.post('/api/internal/meta-review/provision', async (req, res) => {
   if (!requireInternalKey(req, res)) return
+  if (process.env.WHATSAPP_INTERNAL_TENANT_ID) return res.status(409).json({ error: 'The configured internal business number cannot be provisioned as a Meta review test number.' })
   const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID
   if (!phoneNumberId) return res.status(503).json({ error: 'WHATSAPP_PHONE_NUMBER_ID is not configured.' })
   const db = await getDb()
@@ -746,11 +749,7 @@ app.get(['/register', '/login', '/forgot-password', '/reset-password', '/app', '
 })
 
 function requireInternalApi(req: Request, res: Response, next: () => void) {
-  if (process.env.NODE_ENV !== 'production') return next()
-  const key = process.env.INTERNAL_API_KEY
-  const received = req.header('authorization')?.replace(/^Bearer\s+/i, '')
-  if (!key || !received || received !== key) return res.status(404).end()
-  next()
+  if (requireInternalKey(req, res)) next()
 }
 
 function publicConversation(conversation: Conversation) {
@@ -765,19 +764,10 @@ function getConversation(phone: string) {
   return conversation
 }
 
-function validSignature(req: Request) {
-  const secret = process.env.META_APP_SECRET
-  if (!secret) return process.env.NODE_ENV !== 'production'
-  const received = req.header('x-hub-signature-256')
-  if (!received || !(req as Request & { rawBody?: Buffer }).rawBody) return false
-  const expected = `sha256=${crypto.createHmac('sha256', secret).update((req as Request & { rawBody: Buffer }).rawBody).digest('hex')}`
-  const actual = Buffer.from(received)
-  const wanted = Buffer.from(expected)
-  return actual.length === wanted.length && crypto.timingSafeEqual(actual, wanted)
-}
-
-export async function sendWhatsAppTextMessage(to: string, message: string, connection?: Pick<WhatsAppConnection, 'accessToken' | 'accessTokenEncrypted' | 'phoneNumberId'>) {
-  const token = connection?.accessTokenEncrypted ? decryptCredential(connection.accessTokenEncrypted) : connection?.accessToken || process.env.WHATSAPP_ACCESS_TOKEN
+export async function sendWhatsAppTextMessage(to: string, message: string, connection?: Pick<WhatsAppConnection, 'accessToken' | 'accessTokenEncrypted' | 'phoneNumberId' | 'connectionType'>) {
+  const token = !connection || connection.connectionType === 'INTERNAL'
+    ? process.env.WHATSAPP_ACCESS_TOKEN
+    : connection.accessTokenEncrypted ? decryptCredential(connection.accessTokenEncrypted) : connection.accessToken || (connection.phoneNumberId === process.env.WHATSAPP_PHONE_NUMBER_ID ? process.env.WHATSAPP_ACCESS_TOKEN : undefined)
   const phoneNumberId = connection?.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID
   if (!token || !phoneNumberId) throw new Error('WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID are required')
   const response = await fetch(`https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: to.replace(/\D/g, ''), type: 'text', text: { body: message } }) })
@@ -894,62 +884,29 @@ app.get('/readiness', (_req, res) => {
   res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', release: serviceRelease, checks })
 })
 
-app.get('/webhooks/whatsapp', (req, res) => {
-  const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query
-  if (!mode && !token && !challenge) return res.json({ status: 'ready', service: 'afro-intelligent-whatsapp', message: 'Webhook is ready. Meta supplies verification parameters automatically.' })
-  if (mode === 'subscribe' && typeof token === 'string' && token === process.env.WHATSAPP_VERIFY_TOKEN && typeof challenge === 'string') return res.status(200).type('text/plain').send(challenge)
-  return res.status(403).json({ error: 'Webhook verification failed' })
+app.get('/readiness/whatsapp', async (_req, res) => {
+  const checks = {
+    verifyTokenConfigured: Boolean(process.env.WHATSAPP_VERIFY_TOKEN),
+    signatureSecretConfigured: Boolean(process.env.META_APP_SECRET),
+    sessionSecretConfigured: Boolean(process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 32),
+    internalApiProtected: Boolean(process.env.INTERNAL_API_KEY),
+    phoneConfigured: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_BUSINESS_ACCOUNT_ID),
+    databaseReachable: false,
+    internalTenantConnected: false,
+  }
+  try {
+    const db = await getDb()
+    await db.command({ ping: 1 })
+    checks.databaseReachable = true
+    const connection = await getConnectionForPhoneId(process.env.WHATSAPP_PHONE_NUMBER_ID)
+    checks.internalTenantConnected = Boolean(connection && connection.connectionType === 'INTERNAL' && String(connection.tenantId) === process.env.WHATSAPP_INTERNAL_TENANT_ID && connection.wabaId === process.env.WHATSAPP_BUSINESS_ACCOUNT_ID && await db.collection('tenants').findOne({ _id: connection.tenantId, status: 'ACTIVE' }))
+  } catch { /* Report configuration flags without exposing database errors or credentials. */ }
+  const ready = Object.values(checks).every(Boolean)
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', release: serviceRelease, checks })
 })
 
-app.post('/webhooks/whatsapp', async (req, res) => {
-  if (!validSignature(req)) return res.status(401).json({ error: 'Invalid webhook signature' })
-  res.status(200).json({ received: true })
-  const values = req.body?.entry?.flatMap((entry: { changes?: Array<{ value?: unknown }> }) => entry.changes?.map(change => change.value) ?? []) ?? []
-  for (const value of values) {
-    const webhookValue = value as { metadata?: { phone_number_id?: string }; messages?: Array<{ id?: string; from?: string; timestamp?: string; type?: string; text?: { body?: string }; interactive?: { button_reply?: { id?: string; title?: string } } }>; statuses?: Array<{ id?: string; status?: string; timestamp?: string; recipient_id?: string; errors?: unknown[] }> }
-    const connection = await getConnectionForPhoneId(webhookValue.metadata?.phone_number_id).catch(error => {
-      console.error('Unable to resolve WhatsApp tenant connection:', error instanceof Error ? error.message : 'unknown error')
-      return null
-    })
-    const messages = webhookValue.messages ?? []
-    if (connection) {
-      for (const status of webhookValue.statuses ?? []) {
-        if (!status.id || !status.status) continue
-        try {
-          await recordMessageStatus({ tenantId: connection.tenantId, metaMessageId: status.id, status: status.status, timestamp: status.timestamp ? new Date(Number(status.timestamp) * 1000).toISOString() : new Date().toISOString(), recipientId: status.recipient_id, errors: status.errors })
-        } catch (error) {
-          console.error('Unable to persist WhatsApp delivery status:', error instanceof Error ? error.message : 'unknown error')
-        }
-      }
-    }
-    for (const incoming of messages) {
-      if (!incoming.id || !incoming.from || processedMessageIds.has(incoming.id)) continue
-      processedMessageIds.add(incoming.id)
-      const content = incoming.text?.body ?? incoming.interactive?.button_reply?.id ?? incoming.interactive?.button_reply?.title
-      if (!content) continue
-      if (!connection) {
-        console.error('Ignoring WhatsApp message because no connected tenant matches the recipient phone number')
-        continue
-      }
-      const durableEvent = await recordWebhookMessage({
-        tenantId: connection.tenantId,
-        messageId: incoming.id,
-        from: incoming.from,
-        content,
-        type: incoming.type ?? 'text',
-        timestamp: incoming.timestamp ? new Date(Number(incoming.timestamp) * 1000).toISOString() : new Date().toISOString(),
-      })
-      if (durableEvent.duplicate) continue
-      addActivity('New WhatsApp enquiry', content.slice(0, 80))
-      if (durableEvent.automationMode !== 'AI_ACTIVE') continue
-      try {
-        await sendTenantReviewReply(connection, incoming.from, durableEvent.conversationId ?? null, content)
-      } catch (error) {
-        console.error('Unable to send tenant-scoped WhatsApp reply:', error instanceof Error ? error.message : 'unknown error')
-      }
-    }
-  }
-})
+app.use('/webhooks/whatsapp', webhookRouter)
+app.use('/api/whatsapp', whatsappApi)
 
 app.use(['/api/conversations', '/api/dashboard', '/api/tenants'], requireInternalApi)
 app.patch('/api/tenants/:tenantId/conversations/:conversationId/automation', async (req, res) => {
@@ -1023,7 +980,6 @@ app.post('/api/dev/simulate', async (req, res) => {
 
 app.post('/api/dev/reset', (_req, res) => {
   conversations.clear()
-  processedMessageIds.clear()
   activities.splice(0)
   addActivity('Demo reset', 'Ready for a fresh customer conversation')
   res.json({ ok: true })
@@ -1053,11 +1009,22 @@ if (process.env.LOCAL_FRONTEND_PROXY_ENABLED === 'true' && process.env.NODE_ENV 
 
 app.use((error: Error, _req: Request, res: Response, _next: (error?: unknown) => void) => {
   if (error.message === 'Origin is not allowed by CORS') return res.status(403).json({ error: 'Origin is not allowed.' })
-  console.error('Unhandled request error:', error.message)
+  if (error instanceof SyntaxError && 'body' in error) return res.status(400).json({ error: 'Malformed JSON' })
+  if ('status' in error && error.status === 413) return res.status(413).json({ error: 'Payload too large' })
+  console.error('Unhandled request error')
   return res.status(500).json({ error: 'Internal server error.' })
 })
 
-app.listen(port, () => {
-  ensureWhatsappIndexes().catch(error => console.error('Unable to ensure WhatsApp indexes:', error instanceof Error ? error.message : 'unknown error'))
-  console.log(`Afro Intelligent WhatsApp API listening on :${port}; webhook available at /webhooks/whatsapp`)
-})
+export async function startServer(listenPort = port) {
+  await ensureWhatsappIndexes()
+  await provisionInternalTenant(await getDb())
+  const server = createServer(app)
+  const io = attachWhatsAppRealtime(server, process.env.NODE_ENV === 'production' ? productionOrigins : localOrigins)
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(listenPort, resolve) })
+  console.log(`Afro Intelligent WhatsApp API listening; webhook available at /webhooks/whatsapp`)
+  return { server, io }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startServer().catch(async () => { console.error('Startup failed: verify MongoDB, indexes and internal tenant configuration'); await closeMongoClient().catch(() => {}); process.exitCode = 1 })
+}

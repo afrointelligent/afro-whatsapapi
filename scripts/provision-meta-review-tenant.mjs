@@ -4,6 +4,8 @@ import dotenv from 'dotenv'
 dotenv.config()
 dotenv.config({ path: '../../.env.local', override: false })
 
+if (process.env.WHATSAPP_INTERNAL_TENANT_ID) throw new Error('The internal business number cannot be assigned to a Meta review tenant.')
+
 const uri = process.env.MONGODB_URI || process.env.MONGO_URL || process.env.DATABASE_URL
 if (!uri) throw new Error('Set MONGODB_URI or MONGO_URL before provisioning the Meta Review tenant.')
 const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID
