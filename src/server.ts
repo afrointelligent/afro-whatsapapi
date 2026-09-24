@@ -906,7 +906,7 @@ app.get('/readiness/whatsapp', async (_req, res) => {
     checks.internalTenantConnected = Boolean(connection && connection.connectionType === 'INTERNAL' && String(connection.tenantId) === process.env.WHATSAPP_INTERNAL_TENANT_ID && connection.wabaId === process.env.WHATSAPP_BUSINESS_ACCOUNT_ID && await db.collection('tenants').findOne({ _id: connection.tenantId, status: 'ACTIVE' }))
   } catch { /* Report configuration flags without exposing database errors or credentials. */ }
   const ready = Object.values(checks).every(Boolean)
-  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', release: serviceRelease, checks, features: { realtime: pusherConfigured() ? 'pusher' : 'socket.io', automation: process.env.WHATSAPP_AUTOMATION_ENABLED === 'true' } })
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', release: serviceRelease, checks, features: { realtime: pusherConfigured() ? 'pusher' : 'socket.io', automation: process.env.WHATSAPP_AUTOMATION_ENABLED !== 'false' } })
 })
 
 app.use('/webhooks/whatsapp', webhookRouter)
