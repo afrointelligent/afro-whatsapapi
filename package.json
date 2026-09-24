@@ -9,7 +9,8 @@
     "test": "npm run build && node --test tests/*.test.mjs",
     "provision:meta-review": "node scripts/provision-meta-review-tenant.mjs",
     "start": "node dist/server.js",
-    "generate:verify-token": "node scripts/generate-verify-token.mjs"
+    "generate:verify-token": "node scripts/generate-verify-token.mjs",
+    "check:deployment": "node scripts/check-whatsapp-deployment.mjs"
   },
   "dependencies": {
     "@types/multer": "^2.2.0",
@@ -20,6 +21,7 @@
     "mongodb": "^6.21.0",
     "multer": "^2.2.0",
     "nodemailer": "^10.0.0",
+    "pusher": "^5.3.4",
     "socket.io": "^4.8.3"
   },
   "devDependencies": {

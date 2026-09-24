@@ -20,10 +20,11 @@ export async function persistInbound(client: MongoClient, db: Db, input: Inbound
         { $set: { name: input.customerName || input.from, updatedAt: now }, $max: { lastMessageAt: timestamp }, $setOnInsert: { createdAt: now } },
         { upsert: true, returnDocument: 'after', session },
       )
+      const eligible = process.env.WHATSAPP_AUTOMATION_ENABLED === 'true' && String(input.tenantId) === process.env.WHATSAPP_INTERNAL_TENANT_ID
       const conversations = db.collection('whatsappConversations')
       const conversation = await conversations.findOneAndUpdate(
         { tenantId: input.tenantId, customerPhone: input.from },
-        { $set: { contactId: contact!._id, customerName: input.customerName || input.from, updatedAt: now }, $inc: { unreadCount: 1 }, $setOnInsert: { automationMode: 'HUMAN_ACTIVE', createdAt: now } },
+        { $set: { contactId: contact!._id, customerName: input.customerName || input.from, updatedAt: now }, $inc: { unreadCount: 1 }, $setOnInsert: { automationMode: eligible ? 'AI_ACTIVE' : 'HUMAN_ACTIVE', createdAt: now } },
         { upsert: true, returnDocument: 'after', session },
       )
       const conversationId = conversation!._id
@@ -33,6 +34,10 @@ export async function persistInbound(client: MongoClient, db: Db, input: Inbound
       )
       await db.collection('whatsappMessages').insertOne({ tenantId: input.tenantId, conversationId, contactId: contact!._id, metaMessageId: input.messageId, direction: 'inbound', content: input.content, type: input.type, timestamp, payload: input.payload, createdAt: now }, { session })
       await db.collection('whatsappRealtimeEvents').insertOne({ tenantId: input.tenantId, conversationId, metaMessageId: input.messageId, type: 'message.created', createdAt: now, publishedAt: null }, { session })
+      if (eligible && conversation!.automationMode === 'AI_ACTIVE' && conversation!.intake?.status !== 'handoff') {
+        const payload = input.payload as any
+        await db.collection('whatsappAutomationJobs').insertOne({ tenantId: input.tenantId, conversationId, messageId: input.messageId, phone: input.from, content: input.content, button: payload?.interactive?.button_reply?.id || payload?.interactive?.list_reply?.id, timestamp, status: 'pending', createdAt: now }, { session })
+      }
       return { duplicate: false, conversationId, automationMode: String(conversation!.automationMode) }
     })
   } catch (error) {

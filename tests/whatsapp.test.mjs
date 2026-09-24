@@ -8,7 +8,7 @@ import { io as connect } from 'socket.io-client'
 test('WhatsApp: real MongoDB transactions, HTTP and Socket.IO', { timeout: 180000 }, async t => {
   const mongo = process.env.TEST_MONGODB_URI ? null : await MongoMemoryReplSet.create({ replSet: { count: 1 }, binary: { version: '7.0.14' } })
   const testDatabase = 'whatsapp_test_' + crypto.randomBytes(10).toString('hex')
-  Object.assign(process.env, { NODE_ENV: 'test', MONGODB_URI: process.env.TEST_MONGODB_URI || mongo.getUri(), MONGO_DB_NAME: testDatabase, SESSION_SECRET: 'isolated-test-session-secret-at-least-32-characters', META_APP_SECRET: 'isolated-test-app-secret', WHATSAPP_VERIFY_TOKEN: 'isolated-test-verify-token', INTERNAL_API_KEY: 'isolated-test-internal-key', WHATSAPP_PHONE_NUMBER_ID: 'test-phone-a', WHATSAPP_BUSINESS_ACCOUNT_ID: 'test-waba-a', WHATSAPP_ACCESS_TOKEN: '', WHATSAPP_INTERNAL_TENANT_ID: '', LOCAL_FRONTEND_PROXY_ENABLED: 'false' })
+  Object.assign(process.env, { NODE_ENV: 'test', PUSHER_APP_ID: '', PUSHER_KEY: '', PUSHER_SECRET: '', PUSHER_CLUSTER: '', WHATSAPP_AUTOMATION_ENABLED: 'false', DEEPSEEK_API_KEY: '', MONGODB_URI: process.env.TEST_MONGODB_URI || mongo.getUri(), MONGO_DB_NAME: testDatabase, SESSION_SECRET: 'isolated-test-session-secret-at-least-32-characters', META_APP_SECRET: 'isolated-test-app-secret', WHATSAPP_VERIFY_TOKEN: 'isolated-test-verify-token', INTERNAL_API_KEY: 'isolated-test-internal-key', WHATSAPP_PHONE_NUMBER_ID: 'test-phone-a', WHATSAPP_BUSINESS_ACCOUNT_ID: 'test-waba-a', WHATSAPP_ACCESS_TOKEN: '', WHATSAPP_INTERNAL_TENANT_ID: '', LOCAL_FRONTEND_PROXY_ENABLED: 'false' })
   const { getDb, closeMongoClient } = await import('../dist/db.js')
   const { startServer } = await import('../dist/server.js')
   const { signSession } = await import('../dist/auth.js')
@@ -150,4 +150,65 @@ test('WhatsApp: real MongoDB transactions, HTTP and Socket.IO', { timeout: 18000
     await assert.rejects(openSocket(undefined, String(a)), /Tenant access denied/)
     await assert.rejects(openSocket(ca, String(b)), /Tenant access denied/)
   })
+  await t.test('Pusher retries failed publishing and never also publishes through Socket.IO', async () => {
+    const { dispatchRealtime } = await import('../dist/whatsapp-realtime.js')
+    const collection = db.collection('whatsappRealtimeEvents')
+    await collection.updateMany({ publishedAt: null }, { $set: { publishedAt: new Date() } })
+    const id = (await collection.insertOne({ tenantId: a, conversationId: conversation._id, type: 'conversation.updated', publishedAt: null, createdAt: new Date() })).insertedId
+    let socketCalls = 0
+    const fakeSocket = { to() { socketCalls++; return { emit() {} } } }
+    // Enable Pusher while testing so the background worker cannot acknowledge via legacy Socket.IO.
+    Object.assign(process.env, { PUSHER_APP_ID: 'test', PUSHER_KEY: 'test', PUSHER_SECRET: 'test', PUSHER_CLUSTER: 'us3' })
+    await assert.rejects(dispatchRealtime(db, fakeSocket, async () => { throw new Error('offline') }, true), /offline/)
+    assert.equal((await collection.findOne({ _id: id })).publishedAt, null)
+    const published = []
+    await dispatchRealtime(db, fakeSocket, async (...args) => published.push(args), true)
+    assert.equal(published[0][0], `private-whatsapp-${a}`); assert.equal(socketCalls, 0)
+    assert.equal(published[0][2].conversationId, String(conversation._id))
+    assert.ok((await collection.findOne({ _id: id })).publishedAt)
+    Object.assign(process.env, { PUSHER_APP_ID: '', PUSHER_KEY: '', PUSHER_SECRET: '', PUSHER_CLUSTER: '' })
+  })
+  await t.test('intake jobs commit once, preserve human conversations and isolate tenants', async () => {
+    const { persistInbound } = await import('../dist/whatsapp-store.js')
+    const { getMongoClient } = await import('../dist/db.js')
+    process.env.WHATSAPP_AUTOMATION_ENABLED = 'true'
+    const client = await getMongoClient()
+    const input = { tenantId: a, messageId: 'intake-one', from: '27821112222', content: 'Hello', type: 'text', timestamp: new Date().toISOString() }
+    await persistInbound(client, db, input); await persistInbound(client, db, input)
+    assert.equal(await db.collection('whatsappAutomationJobs').countDocuments({ messageId: input.messageId }), 1)
+    await persistInbound(client, db, { ...input, tenantId: b, messageId: 'intake-foreign' })
+    await persistInbound(client, db, { ...input, from: conversation.customerPhone, messageId: 'intake-existing-human' })
+    assert.equal(await db.collection('whatsappAutomationJobs').countDocuments({ messageId: { $in: ['intake-foreign', 'intake-existing-human'] } }), 0)
+    process.env.WHATSAPP_AUTOMATION_ENABLED = 'false'
+  })
+  await t.test('durable intake worker sends a real Meta-shaped menu once and records its receipt', async () => {
+    const { processAutomationJob } = await import('../dist/whatsapp-automation.js')
+    process.env.WHATSAPP_AUTOMATION_ENABLED = 'true'; process.env.WHATSAPP_ACCESS_TOKEN = 'isolated-test-token'
+    process.env.WHATSAPP_BUSINESS_OPEN = '08:00'; process.env.WHATSAPP_BUSINESS_CLOSE = '17:00'
+    let sends = 0
+    const mockMeta = async (url, options) => {
+      sends++; assert.match(url, /test-phone-a\/messages$/)
+      const body = JSON.parse(options.body)
+      assert.equal(body.type, 'interactive'); assert.equal(body.interactive.action.buttons.length, 3)
+      assert.equal(body.interactive.action.buttons[2].reply.id, 'AUTOMATE_WHATSAPP')
+      return new Response(JSON.stringify({ messages: [{ id: 'wamid.intake-menu' }] }), { status: 200 })
+    }
+    const daytime = new Date('2026-09-24T08:00:00Z')
+    await processAutomationJob(db, daytime, mockMeta)
+    await processAutomationJob(db, daytime, mockMeta)
+    await processAutomationJob(db, daytime, mockMeta)
+    assert.equal(sends, 1)
+    assert.equal(await db.collection('whatsappMessages').countDocuments({ tenantId: a, metaMessageId: 'wamid.intake-menu' }), 1)
+    assert.equal((await db.collection('whatsappAutomationJobs').findOne({ messageId: 'intake-one' })).status, 'done')
+    process.env.WHATSAPP_AUTOMATION_ENABLED = 'false'; process.env.WHATSAPP_ACCESS_TOKEN = ''
+  })
+  await t.test('atomic AI allowance enforces ten calls per phone and tenant under concurrency', async () => {
+    const { reserveUsage } = await import('../dist/whatsapp-automation.js')
+    const results = await Promise.all(Array.from({ length: 25 }, () => reserveUsage(db, a, '27821112222', 'ai:isolated-session', 10)))
+    assert.equal(results.filter(Boolean).length, 10)
+    assert.equal(await reserveUsage(db, a, '27821112222', 'ai:isolated-session', 10), false)
+    assert.equal(await reserveUsage(db, b, '27821112222', 'ai:isolated-session', 10), true)
+    assert.equal(await reserveUsage(db, a, '27821112223', 'ai:isolated-session', 10), true)
+  })
+
 })

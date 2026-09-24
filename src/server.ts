@@ -1,3 +1,5 @@
+import { pusherConfigured } from './whatsapp-realtime.js'
+import { startAutomationWorker } from './whatsapp-automation.js'
 import 'dotenv/config'
 import crypto from 'node:crypto'
 import { createServer } from 'node:http'
@@ -24,7 +26,7 @@ type Activity = { id: string; at: string; title: string; detail: string; tone: '
 const port = Number(process.env.PORT ?? 3001)
 const projectDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const apiVersion = process.env.META_API_VERSION ?? 'v25.0'
-const serviceRelease = 'whatsapp-outbound-2026-09-24.1'
+const serviceRelease = 'whatsapp-production-2026-09-24.2'
 const canonicalProductionOrigin = 'https://automate.afrointelligent.co.za'
 export const app = express()
 const verificationUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 }, fileFilter: (_req, file, callback) => callback(null, ['application/pdf', 'image/jpeg', 'image/png'].includes(file.mimetype)) })
@@ -892,6 +894,7 @@ app.get('/readiness/whatsapp', async (_req, res) => {
     sessionSecretConfigured: Boolean(process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 32),
     internalApiProtected: Boolean(process.env.INTERNAL_API_KEY),
     phoneConfigured: Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID && process.env.WHATSAPP_BUSINESS_ACCOUNT_ID),
+    accessTokenConfigured: Boolean(process.env.WHATSAPP_ACCESS_TOKEN?.trim()),
     databaseReachable: false,
     internalTenantConnected: false,
   }
@@ -903,7 +906,7 @@ app.get('/readiness/whatsapp', async (_req, res) => {
     checks.internalTenantConnected = Boolean(connection && connection.connectionType === 'INTERNAL' && String(connection.tenantId) === process.env.WHATSAPP_INTERNAL_TENANT_ID && connection.wabaId === process.env.WHATSAPP_BUSINESS_ACCOUNT_ID && await db.collection('tenants').findOne({ _id: connection.tenantId, status: 'ACTIVE' }))
   } catch { /* Report configuration flags without exposing database errors or credentials. */ }
   const ready = Object.values(checks).every(Boolean)
-  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', release: serviceRelease, checks })
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'configuration_required', release: serviceRelease, checks, features: { realtime: pusherConfigured() ? 'pusher' : 'socket.io', automation: process.env.WHATSAPP_AUTOMATION_ENABLED === 'true' } })
 })
 
 app.use('/webhooks/whatsapp', webhookRouter)
@@ -917,7 +920,7 @@ app.patch('/api/tenants/:tenantId/conversations/:conversationId/automation', asy
   const db = await getDb()
   const result = await db.collection('whatsappConversations').findOneAndUpdate(
     { _id: new ObjectId(conversationId), tenantId: new ObjectId(tenantId) },
-    { $set: { automationMode: mode, updatedAt: new Date() } },
+    { $set: { automationMode: mode, updatedAt: new Date(), handoffReason: mode === 'HUMAN_ACTIVE' ? 'Administrator took over' : null }, ...(mode === 'AI_ACTIVE' ? { $unset: { intake: '' as const } } : {}) },
     { returnDocument: 'after' },
   )
   if (!result) return res.status(404).json({ error: 'Conversation not found' })
@@ -948,6 +951,7 @@ app.post('/api/tenants/:tenantId/conversations/:conversationId/reply', async (re
     db.collection<WhatsAppConnection>('whatsappConnections').findOne({ tenantId: tenantObjectId, status: 'CONNECTED' }),
   ])
   if (!conversation || !connection) return res.status(404).json({ error: 'Connected WhatsApp conversation not found' })
+  await db.collection('whatsappConversations').updateOne({ _id: conversationObjectId, tenantId: tenantObjectId }, { $set: { automationMode: 'HUMAN_ACTIVE', handoffReason: 'Administrator is replying' } })
   try {
     const sent = await sendWhatsAppTextMessage(conversation.customerPhone, content, connection)
     await recordOutboundMessage({ tenantId: tenantObjectId, conversationId: conversationObjectId, metaMessageId: sent.messages?.[0]?.id || crypto.randomUUID(), content })
@@ -1036,6 +1040,7 @@ export async function startServer(listenPort = port) {
   await ensureWhatsappIndexes()
   await provisionInternalTenant(await getDb())
   const server = createServer(app)
+  startAutomationWorker(server)
   const io = attachWhatsAppRealtime(server, process.env.NODE_ENV === 'production' ? productionOrigins : localOrigins)
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(listenPort, resolve) })
   console.log(`Afro Intelligent WhatsApp API listening; webhook available at /webhooks/whatsapp`)

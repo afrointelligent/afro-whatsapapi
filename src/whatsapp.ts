@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { dispatchRealtime, pusherConfigured } from './whatsapp-realtime.js'
 import { Router, type Request, type Response } from 'express'
 import { ObjectId } from 'mongodb'
 import { Server } from 'socket.io'
@@ -117,14 +118,62 @@ whatsappApi.use(async (req, res, next) => {
 })
 whatsappApi.get('/tenants', async (_req, res) => {
   const principal = res.locals.principal as Principal
-  const tenants = await (await getDb()).collection('tenants').find(principal.platform ? {} : { _id: principal.tenantId }, { projection: { name: 1, slug: 1, status: 1 } }).sort({ name: 1 }).limit(200).toArray()
-  res.json({ tenants })
+  const db = await getDb()
+  const tenants = await db.collection('tenants').find(principal.platform ? {} : { _id: principal.tenantId }, { projection: { name: 1, slug: 1, status: 1 } }).sort({ name: 1 }).limit(200).toArray()
+  const ids = tenants.map(tenant => tenant._id)
+  const [connections, summaries] = await Promise.all([
+    db.collection('whatsappConnections').find({ tenantId: { $in: ids } }, { projection: { tenantId: 1, status: 1, connectionType: 1 } }).toArray(),
+    db.collection('whatsappConversations').aggregate([{ $match: { tenantId: { $in: ids } } }, { $group: { _id: '$tenantId', totalConversations: { $sum: 1 }, unreadConversations: { $sum: { $cond: [{ $gt: ['$unreadCount', 0] }, 1, 0] } }, lastActivityAt: { $max: '$lastMessageAt' }, automatedConversations: { $sum: { $cond: [{ $eq: ['$automationMode', 'AI_ACTIVE'] }, 1, 0] } } } }]).toArray(),
+  ])
+  res.json({ tenants: tenants.map(tenant => {
+    const connectionsForTenant = connections.filter(connection => connection.tenantId.equals(tenant._id))
+    const summary = summaries.find(row => row._id.equals(tenant._id))
+    return { ...tenant, isInternal: connectionsForTenant.some(connection => connection.connectionType === 'INTERNAL'), connectionStatus: connectionsForTenant.some(connection => connection.status === 'CONNECTED') ? 'CONNECTED' : 'NOT_CONNECTED', totalConversations: summary?.totalConversations || 0, unreadConversations: summary?.unreadConversations || 0, lastActivityAt: summary?.lastActivityAt || null, automationStatus: summary?.automatedConversations ? 'ACTIVE' : 'MANUAL' }
+  }) })
 })
 whatsappApi.use('/tenants/:tenantId', (req, res, next) => {
   if (!ObjectId.isValid(req.params.tenantId)) return res.status(400).json({ error: 'Invalid tenant ID' })
   if (!permitted(res.locals.principal, req.params.tenantId)) return res.status(403).json({ error: 'Tenant access denied' })
   res.locals.tenantId = new ObjectId(req.params.tenantId)
   next()
+})
+export function issueRealtimeTicket(tenantId: string) {
+  const key = process.env.INTERNAL_API_KEY
+  if (!key) throw new Error('Realtime signing key unavailable')
+  const payload = Buffer.from(JSON.stringify({ tenantId, aud: 'whatsapp-realtime', exp: Date.now() + 300_000 })).toString('base64url')
+  return `${payload}.${crypto.createHmac('sha256', key).update(payload).digest('base64url')}`
+}
+export function readRealtimeTicket(ticket: unknown): Principal | null {
+  try {
+    if (typeof ticket !== 'string' || !process.env.INTERNAL_API_KEY) return null
+    const [payload, signature, extra] = ticket.split('.')
+    if (extra || !payload || !secretsEqual(signature, crypto.createHmac('sha256', process.env.INTERNAL_API_KEY).update(payload).digest('base64url'))) return null
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString())
+    if (data.aud !== 'whatsapp-realtime' || typeof data.exp !== 'number' || data.exp <= Date.now() || !ObjectId.isValid(data.tenantId)) return null
+    return { platform: false, tenantId: new ObjectId(data.tenantId) }
+  } catch { return null }
+}
+whatsappApi.post('/tenants/:tenantId/realtime-token', async (_req, res) => {
+  const tenantId = res.locals.tenantId as ObjectId
+  if (!await (await getDb()).collection('tenants').findOne({ _id: tenantId, status: 'ACTIVE' })) return res.status(404).json({ error: 'Active tenant not found' })
+  res.setHeader('Cache-Control', 'no-store')
+  res.json({ token: issueRealtimeTicket(String(tenantId)), expiresIn: 300 })
+})
+whatsappApi.post('/tenants/:tenantId/conversations/:conversationId/read', async (req, res) => {
+  if (!ObjectId.isValid(req.params.conversationId)) return res.status(400).json({ error: 'Invalid conversation ID' })
+  // Only mark the version the client displayed, so a racing inbound message stays unread.
+  const date = new Date(req.body?.lastMessageAt)
+  if (!Number.isFinite(date.getTime())) return res.status(400).json({ error: 'Invalid message timestamp' })
+  const db = await getDb(), session = (await getMongoClient()).startSession()
+  try {
+    const read = await session.withTransaction(async () => {
+      const conversationId = new ObjectId(req.params.conversationId)
+      const result = await db.collection('whatsappConversations').updateOne({ _id: conversationId, tenantId: res.locals.tenantId, lastMessageAt: date }, { $set: { unreadCount: 0 } }, { session })
+      if (result.modifiedCount) await db.collection('whatsappRealtimeEvents').insertOne({ tenantId: res.locals.tenantId, conversationId, type: 'conversation.read', createdAt: new Date(), publishedAt: null }, { session })
+      return result.matchedCount > 0
+    })
+    res.json({ read })
+  } finally { await session.endSession() }
 })
 function pageSize(req: Request) { return Math.min(100, Math.max(1, Number(req.query.limit) || 50)) }
 whatsappApi.get('/tenants/:tenantId/conversations', async (req, res) => {
@@ -145,23 +194,23 @@ whatsappApi.get('/tenants/:tenantId/conversations/:conversationId/messages', asy
 
 /** Transactional outbox: reconnecting clients refetch the inbox; event IDs deduplicate retries. */
 export async function publishPendingEvents(io: Server) {
-  const db = await getDb()
-  const events = await db.collection('whatsappRealtimeEvents').find({ publishedAt: null }).sort({ _id: 1 }).limit(100).toArray()
-  for (const event of events) {
-    io.to(`tenant:${event.tenantId}`).emit('whatsapp.event', { id: String(event._id), type: event.type, tenantId: String(event.tenantId), conversationId: event.conversationId ? String(event.conversationId) : null, metaMessageId: event.metaMessageId, status: event.status })
-    await db.collection('whatsappRealtimeEvents').updateOne({ _id: event._id, publishedAt: null }, { $set: { publishedAt: new Date() } })
-  }
+  await dispatchRealtime(await getDb(), io)
 }
 
 export function attachWhatsAppRealtime(server: HttpServer, origins: string[]) {
   const io = new Server(server, {
     cors: { origin: origins, credentials: true },
-    allowRequest: (req, callback) => callback(null, !req.headers.origin || origins.includes(req.headers.origin)),
+    // Cross-origin WebSocket clients must present a short-lived tenant ticket below.
+    connectTimeout: 10_000,
   })
   io.use(async (socket, next) => {
+    if (pusherConfigured()) return next(new Error('Use the configured Pusher connection'))
     try {
       const authorization = socket.handshake.headers.authorization
-      const principal = await authenticateWhatsApp(socket.handshake.headers.cookie, authorization)
+      const ticket = readRealtimeTicket(socket.handshake.auth?.token)
+      const origin = socket.handshake.headers.origin
+      if (origin && !origins.includes(origin) && !ticket) return next(new Error('Tenant access denied'))
+      const principal = ticket || await authenticateWhatsApp(socket.handshake.headers.cookie, authorization)
       const id = socket.handshake.auth?.tenantId || String(principal?.tenantId || '')
       if (!principal || typeof id !== 'string' || !ObjectId.isValid(id) || !permitted(principal, id)) return next(new Error('Tenant access denied'))
       if (!await (await getDb()).collection('tenants').findOne({ _id: new ObjectId(id), status: 'ACTIVE' })) return next(new Error('Tenant access denied'))
@@ -175,7 +224,7 @@ export function attachWhatsAppRealtime(server: HttpServer, origins: string[]) {
     // Revalidate membership and account suspension for long-lived connections.
     const authTimer = setInterval(async () => {
       try {
-        const principal = await authenticateWhatsApp(socket.handshake.headers.cookie, socket.handshake.headers.authorization)
+        const principal = socket.handshake.auth?.token ? readRealtimeTicket(socket.handshake.auth.token) : await authenticateWhatsApp(socket.handshake.headers.cookie, socket.handshake.headers.authorization)
         if (!principal || !permitted(principal, socket.data.tenantId)) socket.disconnect(true)
       } catch { socket.disconnect(true) }
     }, 60_000)

@@ -1,4 +1,4 @@
-﻿# WhatsApp inbound foundation: Meta configuration gate
+# WhatsApp inbound foundation: Meta configuration gate
 
 The backend is implemented and tested locally. The production domain was reachable and its existing verification token passed a GET challenge. The new release has NOT been deployed by this task: Render credentials/CLI are unavailable and browser startup failed. No real WhatsApp message was sent and the Super Admin project was not inspected or edited.
 
@@ -36,7 +36,7 @@ Set these server-only variables:
 
 Retain existing `CREDENTIAL_ENCRYPTION_KEY`, `META_APP_ID`, `META_EMBEDDED_SIGNUP_CONFIG_ID`, SMTP and other unrelated production settings. Do not rotate the encryption key: existing customer credentials depend on it. Embedded Signup, DeepSeek, test-recipient and payment variables are not prerequisites for receiving inbound messages.
 
-After deploying, `/health` must show release `whatsapp-foundation-2026-09-22.1` and `/readiness/whatsapp` must return HTTP 200 with all checks true. The older `/readiness` checks unrelated Embedded Signup features as well. Run `node scripts/check-whatsapp-deployment.mjs` to check release, readiness and token verification without sending a WhatsApp message. This command intentionally fails against the old release.
+After deploying, `/health` must show release `whatsapp-production-2026-09-24.2` and `/readiness/whatsapp` must return HTTP 200 with all checks true. The older `/readiness` checks unrelated Embedded Signup features as well. Run `node scripts/check-whatsapp-deployment.mjs` to check release, readiness and token verification without sending a WhatsApp message. This command intentionally fails against the old release.
 
 ## Meta settings
 

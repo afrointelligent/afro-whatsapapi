@@ -1,4 +1,4 @@
-﻿export type MetaConnection = { phoneNumberId: string; accessToken: string; apiVersion: string }
+export type MetaConnection = { phoneNumberId: string; accessToken: string; apiVersion: string }
 export type MetaSendResult = { messages?: Array<{ id: string }> }
 type MetaErrorBody = { error?: { code?: number; error_subcode?: number; type?: string; fbtrace_id?: string; message?: string } }
 
@@ -18,11 +18,20 @@ export function metaSendError(status: number, body: MetaErrorBody) {
 }
 
 export async function sendMetaText(connection: MetaConnection, to: string, content: string, fetcher: typeof fetch = fetch): Promise<MetaSendResult> {
+  return sendMetaPayload(connection, to, { type: 'text', text: { body: content } }, fetcher)
+}
+
+export async function sendMetaButtons(connection: MetaConnection, to: string, content: string, choices: Array<{ id: string; title: string }>, fetcher: typeof fetch = fetch) {
+  if (!choices.length || choices.length > 3 || choices.some(choice => choice.title.length > 20)) throw new Error('Invalid reply buttons')
+  return sendMetaPayload(connection, to, { type: 'interactive', interactive: { type: 'button', body: { text: content }, action: { buttons: choices.map(reply => ({ type: 'reply', reply })) } } }, fetcher)
+}
+
+async function sendMetaPayload(connection: MetaConnection, to: string, payload: object, fetcher: typeof fetch): Promise<MetaSendResult> {
   const accessToken = connection.accessToken.trim()
   if (!accessToken || !connection.phoneNumberId) throw new WhatsAppSendError('WHATSAPP_SENDING_NOT_CONFIGURED', 'The server-side WhatsApp sending credential is not configured.')
   const response = await fetcher(`https://graph.facebook.com/${connection.apiVersion}/${connection.phoneNumberId}/messages`, {
     method: 'POST', headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messaging_product: 'whatsapp', to: to.replace(/\D/g, ''), type: 'text', text: { body: content } }),
+    body: JSON.stringify({ messaging_product: 'whatsapp', to: to.replace(/\D/g, ''), ...payload }),
     signal: AbortSignal.timeout(20000),
   })
   const body = await response.json().catch(() => ({})) as MetaErrorBody & MetaSendResult
