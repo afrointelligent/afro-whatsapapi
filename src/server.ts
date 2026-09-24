@@ -3,6 +3,7 @@ import crypto from 'node:crypto'
 import { createServer } from 'node:http'
 import { webhookRouter, whatsappApi, attachWhatsAppRealtime } from './whatsapp.js'
 import { provisionInternalTenant } from './whatsapp-store.js'
+import { sendMetaText, inspectMetaCredential, WhatsAppSendError } from './whatsapp-outbound.js'
 import cors from 'cors'
 import express, { type Request, type Response } from 'express'
 import path from 'node:path'
@@ -23,7 +24,7 @@ type Activity = { id: string; at: string; title: string; detail: string; tone: '
 const port = Number(process.env.PORT ?? 3001)
 const projectDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const apiVersion = process.env.META_API_VERSION ?? 'v25.0'
-const serviceRelease = 'whatsapp-foundation-2026-09-22.1'
+const serviceRelease = 'whatsapp-outbound-2026-09-24.1'
 const canonicalProductionOrigin = 'https://automate.afrointelligent.co.za'
 export const app = express()
 const verificationUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 }, fileFilter: (_req, file, callback) => callback(null, ['application/pdf', 'image/jpeg', 'image/png'].includes(file.mimetype)) })
@@ -764,17 +765,17 @@ function getConversation(phone: string) {
   return conversation
 }
 
-export async function sendWhatsAppTextMessage(to: string, message: string, connection?: Pick<WhatsAppConnection, 'accessToken' | 'accessTokenEncrypted' | 'phoneNumberId' | 'connectionType'>) {
+function outboundConnection(connection?: Pick<WhatsAppConnection, 'accessToken' | 'accessTokenEncrypted' | 'phoneNumberId' | 'connectionType'>) {
   const token = !connection || connection.connectionType === 'INTERNAL'
     ? process.env.WHATSAPP_ACCESS_TOKEN
     : connection.accessTokenEncrypted ? decryptCredential(connection.accessTokenEncrypted) : connection.accessToken || (connection.phoneNumberId === process.env.WHATSAPP_PHONE_NUMBER_ID ? process.env.WHATSAPP_ACCESS_TOKEN : undefined)
   const phoneNumberId = connection?.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID
-  if (!token || !phoneNumberId) throw new Error('WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID are required')
-  const response = await fetch(`https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: to.replace(/\D/g, ''), type: 'text', text: { body: message } }) })
-  const result = await response.json() as { error?: { message?: string }; messages?: Array<{ id: string }> }
-  if (!response.ok) throw new Error(result.error?.message ?? 'Meta Cloud API rejected the request')
-  return result
+  return { accessToken: token || '', phoneNumberId: phoneNumberId || '', apiVersion }
 }
+export async function sendWhatsAppTextMessage(to: string, message: string, connection?: Pick<WhatsAppConnection, 'accessToken' | 'accessTokenEncrypted' | 'phoneNumberId' | 'connectionType'>) {
+  return sendMetaText(outboundConnection(connection), to, message)
+}
+
 
 async function sendTenantReviewReply(connection: WhatsAppConnection, customerPhone: string, conversationId: import('mongodb').ObjectId | null, content: string) {
   if (connection.connectionType !== 'META_TEST_NUMBER') return
@@ -922,10 +923,23 @@ app.patch('/api/tenants/:tenantId/conversations/:conversationId/automation', asy
   if (!result) return res.status(404).json({ error: 'Conversation not found' })
   res.json({ conversation: result })
 })
+app.get('/api/tenants/:tenantId/whatsapp/send-credentials', async (req, res) => {
+  if (!ObjectId.isValid(req.params.tenantId)) return res.status(400).json({ error: 'Invalid tenant ID' })
+  const connection = await (await getDb()).collection<WhatsAppConnection>('whatsappConnections').findOne({ tenantId: new ObjectId(req.params.tenantId), status: 'CONNECTED' })
+  if (!connection) return res.status(404).json({ error: 'Connected WhatsApp account not found' })
+  res.setHeader('Cache-Control', 'private, no-store')
+  try { res.json(await inspectMetaCredential(outboundConnection(connection))) }
+  catch (error) {
+    const failure = error instanceof WhatsAppSendError ? error : new WhatsAppSendError('WHATSAPP_CREDENTIAL_CHECK_FAILED', 'Unable to check the sending credential.')
+    res.status(502).json({ error: failure.message, code: failure.code, ...failure.details })
+  }
+})
 app.post('/api/tenants/:tenantId/conversations/:conversationId/reply', async (req, res) => {
   const { tenantId, conversationId } = req.params
   const content = String(req.body?.content || '').trim()
-  if (!ObjectId.isValid(tenantId) || !ObjectId.isValid(conversationId) || !content) return res.status(400).json({ error: 'Invalid reply request' })
+  const requestId = crypto.randomUUID()
+  res.setHeader('X-Request-Id', requestId)
+  if (!ObjectId.isValid(tenantId) || !ObjectId.isValid(conversationId) || !content || content.length > 4096) return res.status(400).json({ error: 'Invalid reply request' })
   const db = await getDb()
   const tenantObjectId = new ObjectId(tenantId)
   const conversationObjectId = new ObjectId(conversationId)
@@ -937,9 +951,12 @@ app.post('/api/tenants/:tenantId/conversations/:conversationId/reply', async (re
   try {
     const sent = await sendWhatsAppTextMessage(conversation.customerPhone, content, connection)
     await recordOutboundMessage({ tenantId: tenantObjectId, conversationId: conversationObjectId, metaMessageId: sent.messages?.[0]?.id || crypto.randomUUID(), content })
-    res.json({ ok: true, metaMessageId: sent.messages?.[0]?.id || null })
+    console.info(JSON.stringify({ event: 'whatsapp.outbound.accepted', requestId, tenantId, conversationId, metaMessageId: sent.messages?.[0]?.id }))
+    res.json({ ok: true, metaMessageId: sent.messages?.[0]?.id || null, requestId })
   } catch (error) {
-    res.status(502).json({ error: error instanceof Error ? error.message : 'Unable to send WhatsApp message' })
+    const failure = error instanceof WhatsAppSendError ? error : new WhatsAppSendError('WHATSAPP_SEND_FAILED', 'The reply could not be confirmed. Check its delivery before retrying.')
+    console.error(JSON.stringify({ event: 'whatsapp.outbound.failed', requestId, tenantId, conversationId, code: failure.code, ...failure.details }))
+    res.status(502).json({ error: failure.message, code: failure.code, requestId, ...failure.details })
   }
 })
 app.get('/api/conversations', (_req, res) => res.json([...conversations.values()].sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt)).map(publicConversation)))
