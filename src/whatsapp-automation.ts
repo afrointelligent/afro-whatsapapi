@@ -7,7 +7,7 @@ import { sendMetaText, sendMetaButtons, WhatsAppSendError } from './whatsapp-out
 import { businessClock, planIntake, intakeSummary, type IntakeState } from './whatsapp-intake.js'
 
 export function automationEnabled(tenantId: ObjectId) {
-  return process.env.WHATSAPP_AUTOMATION_ENABLED === 'true' && String(tenantId) === process.env.WHATSAPP_INTERNAL_TENANT_ID
+  return process.env.WHATSAPP_AUTOMATION_ENABLED !== 'false' && String(tenantId) === process.env.WHATSAPP_INTERNAL_TENANT_ID
 }
 export async function reserveUsage(db: Db, tenantId: ObjectId, phone: string, bucket: string, limit: number) {
   const key = crypto.createHash('sha256').update(`${tenantId}:${phone}:${bucket}`).digest('hex')
@@ -111,10 +111,10 @@ export async function processAutomationJob(db: Db, intakeTime = new Date(), fetc
   } finally { await locks.updateOne({ _id: tenantId, owner }, { $set: { until: new Date(0) } }) }
 }
 export function startAutomationWorker(server: Server) {
-  if (process.env.WHATSAPP_AUTOMATION_ENABLED !== 'true') return
+  if (process.env.WHATSAPP_AUTOMATION_ENABLED === 'false') return
   let running = false
   const timer = setInterval(async () => {
-    if (running || process.env.WHATSAPP_AUTOMATION_ENABLED !== 'true') return
+    if (running || process.env.WHATSAPP_AUTOMATION_ENABLED === 'false') return
     running = true
     try { await processAutomationJob(await getDb()) } catch { console.error('WhatsApp intake processing will resume') } finally { running = false }
   }, 1000)

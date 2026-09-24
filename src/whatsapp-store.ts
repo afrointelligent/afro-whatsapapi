@@ -20,7 +20,7 @@ export async function persistInbound(client: MongoClient, db: Db, input: Inbound
         { $set: { name: input.customerName || input.from, updatedAt: now }, $max: { lastMessageAt: timestamp }, $setOnInsert: { createdAt: now } },
         { upsert: true, returnDocument: 'after', session },
       )
-      const eligible = process.env.WHATSAPP_AUTOMATION_ENABLED === 'true' && String(input.tenantId) === process.env.WHATSAPP_INTERNAL_TENANT_ID
+      const eligible = process.env.WHATSAPP_AUTOMATION_ENABLED !== 'false' && String(input.tenantId) === process.env.WHATSAPP_INTERNAL_TENANT_ID
       const conversations = db.collection('whatsappConversations')
       const conversation = await conversations.findOneAndUpdate(
         { tenantId: input.tenantId, customerPhone: input.from },
