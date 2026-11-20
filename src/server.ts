@@ -1036,17 +1036,65 @@ app.use((error: Error, _req: Request, res: Response, _next: (error?: unknown) =>
   return res.status(500).json({ error: 'Internal server error.' })
 })
 
+function startupFailureReason(error: unknown) {
+  if (!(error instanceof Error)) return 'unknown error'
+
+  switch (error.message) {
+    case 'MONGODB_URI is required for durable WhatsApp processing':
+      return 'MongoDB connection variable is missing'
+    case 'Internal WhatsApp tenant configuration is incomplete':
+      return 'internal WhatsApp tenant configuration is incomplete'
+    case 'Configured internal WhatsApp tenant does not exist or is inactive':
+      return 'configured internal tenant is missing or inactive'
+    case 'WhatsApp phone is already assigned to another tenant':
+      return 'WhatsApp phone belongs to another tenant'
+  }
+
+  // Driver messages can contain credentials or customer data. Log only known error categories.
+  const code = 'code' in error ? error.code : undefined
+  switch (code) {
+    case 13: return 'MongoDB permission denied'
+    case 18:
+    case 8000: return 'MongoDB authentication or Atlas connection rejected'
+    case 85:
+    case 86: return 'MongoDB index definition conflicts with an existing index'
+    case 11000: return 'duplicate values prevent a unique index or tenant binding'
+    case 'EADDRINUSE': return 'HTTP port is already in use'
+    case 'EACCES': return 'permission denied while opening a connection'
+  }
+
+  switch (error.name) {
+    case 'MongoParseError': return 'MongoDB connection URI is invalid'
+    case 'MongoServerSelectionError':
+    case 'MongoNetworkError': return 'MongoDB server could not be reached'
+    default: return 'unclassified error'
+  }
+}
+
 export async function startServer(listenPort = port) {
-  await ensureWhatsappIndexes()
-  await provisionInternalTenant(await getDb())
-  const server = createServer(app)
-  startAutomationWorker(server)
-  const io = attachWhatsAppRealtime(server, process.env.NODE_ENV === 'production' ? productionOrigins : localOrigins)
-  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(listenPort, resolve) })
-  console.log(`Afro Intelligent WhatsApp API listening; webhook available at /webhooks/whatsapp`)
-  return { server, io }
+  let phase = 'MongoDB connection'
+  try {
+    const db = await getDb()
+    phase = 'MongoDB indexes'
+    await ensureWhatsappIndexes()
+    phase = 'WhatsApp tenant'
+    await provisionInternalTenant(db)
+    phase = 'HTTP server'
+    const server = createServer(app)
+    startAutomationWorker(server)
+    const io = attachWhatsAppRealtime(server, process.env.NODE_ENV === 'production' ? productionOrigins : localOrigins)
+    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(listenPort, resolve) })
+    console.log('Afro Intelligent WhatsApp API listening; webhook available at /webhooks/whatsapp')
+    return { server, io }
+  } catch (error) {
+    console.error(`Startup failed during ${phase}: ${startupFailureReason(error)}`)
+    throw error
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  startServer().catch(async () => { console.error('Startup failed: verify MongoDB, indexes and internal tenant configuration'); await closeMongoClient().catch(() => {}); process.exitCode = 1 })
+  startServer().catch(async () => {
+    await closeMongoClient().catch(() => {})
+    process.exitCode = 1
+  })
 }
